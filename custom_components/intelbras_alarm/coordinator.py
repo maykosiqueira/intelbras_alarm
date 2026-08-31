@@ -38,6 +38,7 @@ from .const import (
     FAMILY_2018,
     FAMILY_4010,
     FAMILY_8000,
+    FAMILY_ANM24_G2,
     FAMILY_MAX_ZONES,
     FAMILY_STATUS_CMD,
     FAMILY_STATUS_LEN,
@@ -60,6 +61,8 @@ from .const import (
 from .panel_client import PanelClient, PanelConnectionError
 from .panel_client_amt8000 import Amt8000AuthError, PanelConnectionErrorAmt8000
 from . import protocol_amt8000 as amt8000
+from . import protocol_anm24 as anm24
+from .panel_client_anm24 import Anm24ConnectionError
 from .protocol import (
     ESmartExtraStatus,
     NackError,
@@ -198,6 +201,11 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
         # caso nem tenta se comunicar com a central (ver
         # _async_update_data), só precisa de um log próprio na transição.
         self._disabled_logged = False
+        # Firmware da ANM 24 Net G2, lido uma vez por sessão: ele não muda com
+        # a central ligada, e cada consulta extra ocupa a única sessão local
+        # que essa central aceita por vez (ver panel_client_anm24.py).
+        self._anm24_firmware: str | None = None
+        self._anm24_model_name: str | None = None
 
         # Zonas que nascem habilitadas por padrão no Home Assistant,
         # configurável pelo usuário na inclusão da integração (formato
@@ -500,6 +508,8 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
             _LOGGER.info('Switch "Conexão com a central" reativado — retomando consultas')
             self._disabled_logged = False
 
+        if self.family == FAMILY_ANM24_G2:
+            return await self._async_update_data_anm24()
         if self.family == FAMILY_8000:
             return await self._async_update_data_amt8000()
 
@@ -602,6 +612,77 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
         self.last_status_raw = response.content.hex(" ").upper()
 
         return status
+
+    async def _async_update_data_anm24(self) -> PanelStatus:
+        """Consulta de status da ANM 24 Net G2 (0x0B01, protocolo local V2).
+
+        O firmware vem de 0x0060 e e lido uma vez so: ele nao muda enquanto a
+        central estiver ligada, e cada consulta extra ocupa a unica sessao
+        local que a central aceita por vez.
+        """
+        try:
+            if self._anm24_firmware is None:
+                info = await self.client.send_command(
+                    anm24.cmd_model(), context="modelo/firmware (ANM 24 G2)"
+                )
+                codigo, self._anm24_firmware = anm24.parse_model(info.content)
+                # O nome vem da tabela do projeto, não de um literal aqui: se
+                # um dia a central reportar outro código, o log e as entidades
+                # mostram o modelo real em vez de mentir "ANM 24 Net G2".
+                self._anm24_model_name = MODEL_TABLE.get(
+                    codigo, (MODEL_UNKNOWN, f"Desconhecido (0x{codigo:02X})", "", 0, 0)
+                )[1]
+
+            resposta = await self.client.send_command(
+                anm24.cmd_status(), context="consulta de status (ANM 24 G2)"
+            )
+            if resposta.is_nack:
+                raise UpdateFailed("A central recusou o comando de status (NACK)")
+            if not resposta.valid_checksum:
+                raise UpdateFailed("Checksum invalido na resposta de status")
+            bruto = anm24.parse_status(resposta.content)
+        except (*_ANY_PANEL_CONNECTION_ERROR, Anm24ConnectionError, UpdateFailed, IndexError, ValueError) as err:
+            self._handle_poll_failure(err)
+            if self.data is not None:
+                return self.data
+            raise UpdateFailed(str(err)) from err
+
+        if self._poll_failure_logged:
+            elapsed = (
+                time.monotonic() - self._last_poll_success_monotonic
+                if self._last_poll_success_monotonic is not None
+                else 0.0
+            )
+            _LOGGER.warning(
+                "Comunicação com a ANM 24 Net G2 reestabelecida (ficou sem "
+                "responder por cerca de %.1fs)",
+                elapsed,
+            )
+            self._poll_failure_logged = False
+        self._last_poll_success_monotonic = time.monotonic()
+
+        return anm24.build_panel_status(
+            bruto,
+            model_key=self.model_key,
+            model_name=self._anm24_model_name or "",
+            family=self.family,
+            firmware=self._anm24_firmware or "",
+        )
+
+    async def async_read_beep(self) -> bool:
+        """Le o bipe de arme/desarme (0x351A)."""
+        resposta = await self.client.send_command(
+            anm24.cmd_read_beep(), context="leitura do bipe de arme"
+        )
+        return anm24.parse_beep(resposta.content)
+
+    async def async_set_beep(self, enabled: bool) -> None:
+        """Liga ou desliga o bipe de arme/desarme (0x251A)."""
+        resposta = await self.client.send_command(
+            anm24.cmd_write_beep(enabled), context="gravacao do bipe de arme"
+        )
+        if resposta.is_nack:
+            raise HomeAssistantError("A central recusou a alteracao do bipe de arme")
 
     async def _async_update_data_amt8000(self) -> PanelStatus:
         """Consulta de status para a família AMT 8000 (protocolo próprio).
@@ -747,6 +828,19 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
     # Comandos de alto nível usados pelas entidades
     # ------------------------------------------------------------------
     async def async_arm(self, partition: str | None, stay: bool, password: str | None = None) -> None:
+        if self.family == FAMILY_ANM24_G2:
+            if stay:
+                # 0x02 existe na tabela de operacoes, mas nunca foi executado
+                # nesta central - melhor recusar do que arriscar um estado que
+                # ninguem verificou.
+                raise HomeAssistantError(
+                    "Arme parcial ainda nao foi validado na ANM 24 Net G2"
+                )
+            frame = anm24.cmd_arm_disarm(anm24.ALL_PARTITIONS, anm24.MODE_ARM_AWAY)
+            await self._send_and_check_anm24(frame, "Ativar a central")
+            self.armed_home_mode[partition or "CENTRAL"] = False
+            await self.async_request_refresh()
+            return
         if self.family == FAMILY_8000:
             mode = AMT8000_MODE_STAY if stay else AMT8000_MODE_ARM
             partition_num = int(partition) if partition is not None else AMT8000_ALL_PARTITIONS
@@ -766,6 +860,12 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
         await self.async_request_refresh()
 
     async def async_disarm(self, partition: str | None, password: str | None = None) -> None:
+        if self.family == FAMILY_ANM24_G2:
+            frame = anm24.cmd_arm_disarm(anm24.ALL_PARTITIONS, anm24.MODE_DISARM)
+            await self._send_and_check_anm24(frame, "Desativar a central")
+            self.armed_home_mode[partition or "CENTRAL"] = False
+            await self.async_request_refresh()
+            return
         if self.family == FAMILY_8000:
             partition_num = int(partition) if partition is not None else AMT8000_ALL_PARTITIONS
             frame = amt8000.cmd_arm_disarm(partition_num, AMT8000_MODE_DISARM)
@@ -1098,6 +1198,41 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
             # de forma amigável na UI/serviço, em vez de uma exceção
             # genérica não tratada.
             raise HomeAssistantError(err.message) from err
+
+    async def _send_and_check_anm24(self, frame: bytes, action_label: str | None = None) -> None:
+        """Envia um comando de ação para a ANM 24 Net G2 e confere a resposta.
+
+        Diferente da AMT 8000, aqui o retorno **é** verificável: esta central
+        responde ``0xF0FD`` (NACK) ao que recusa — foi assim que se descobriu
+        que ela não aceita o status ``0x0B4A`` da 8000, recusado 51 vezes
+        seguidas numa captura do app oficial. Arme e desarme foram executados
+        no hardware e ecoam o próprio comando com o bit alto ligado no último
+        byte (``0x81`` para armar, ``0x80`` para desarmar).
+        """
+        if action_label:
+            self.last_command_result = f"{action_label}..."
+            self.last_command_action = action_label
+            self.last_command_frame_hex = frame.hex(" ").upper()
+            self.async_update_listeners()
+        try:
+            resposta = await self.client.send_command(frame, context=action_label)
+        except (*_ANY_PANEL_CONNECTION_ERROR, Anm24ConnectionError) as err:
+            self.last_command_result = f"{action_label + ': ' if action_label else ''}{err}"
+            if action_label:
+                self.last_command_response_hex = None
+            self.async_update_listeners()
+            raise HomeAssistantError(str(err)) from err
+
+        if action_label:
+            self.last_command_response_hex = resposta.raw.hex(" ").upper()
+        if resposta.is_nack:
+            self.last_command_result = (
+                f"{action_label + ': ' if action_label else ''}recusado pela central (NACK)"
+            )
+            self.async_update_listeners()
+            raise HomeAssistantError(f"A central recusou: {action_label or 'comando'}")
+        self.last_command_result = f"{action_label}: ok" if action_label else "ok"
+        self.async_update_listeners()
 
     async def _send_and_check_amt8000(self, frame: bytes, action_label: str | None = None) -> None:
         """Equivalente a ``_send_and_check`` para a AMT 8000.
@@ -1787,5 +1922,36 @@ async def async_detect_amt8000(host: str, port: int, password: str) -> tuple[str
         except Amt8000AuthError as err:
             raise NackError(0xE1) from err  # reaproveita "Senha incorreta" na UI
         return MODEL_AMT_8000, AMT_8000_MODEL_NAME, FAMILY_8000
+    finally:
+        await client.disconnect()
+
+
+async def async_detect_anm24(host: str, port: int, password: str) -> tuple[str, str, str]:
+    """Confirma que o host responde como ANM 24 Net G2 no protocolo local V2.
+
+    Não passa pela sondagem automática de ``async_detect_model``, e não é por
+    preferência: esta central **ignora em silêncio** o ``0x5A`` do ISECMobile
+    usado por aquela detecção. Dez frames V1 bem formados, com senhas de 4 e de
+    6 dígitos, não produziram nem resposta nem código de erro — sondar por lá
+    nunca a encontraria.
+
+    Aqui a identificação é direta: abre a sessão, autentica e lê ``0x0060``,
+    que devolve o código do modelo e o firmware.
+    """
+    from .panel_client_anm24 import PanelClientAnm24
+
+    client = PanelClientAnm24(host, port, password, timeout=DEFAULT_REQUEST_TIMEOUT)
+    try:
+        resposta = await client.send_command(anm24.cmd_model(), context="detecção do modelo")
+        codigo, firmware = anm24.parse_model(resposta.content)
+        entrada = MODEL_TABLE.get(codigo)
+        if entrada is None or entrada[2] != FAMILY_ANM24_G2:
+            nome = entrada[1] if entrada else f"desconhecido (0x{codigo:02X})"
+            raise HomeAssistantError(
+                f"A central respondeu como {nome}, que não usa este protocolo. "
+                "Desmarque a opção da ANM 24 Net G2 e deixe a detecção automática."
+            )
+        _LOGGER.debug("ANM 24 G2 detectada: firmware %s", firmware)
+        return entrada[0], entrada[1], entrada[2]
     finally:
         await client.disconnect()

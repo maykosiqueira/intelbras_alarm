@@ -23,11 +23,13 @@ from .const import (
     DEFAULT_REQUEST_TIMEOUT,
     DOMAIN,
     FAMILY_8000,
+    FAMILY_ANM24_G2,
 )
 from .coordinator import IntelbrasAlarmCoordinator
 from .names_state import async_load_names
 from .panel_client import PanelClient
 from .panel_client_amt8000 import PanelClientAmt8000
+from .panel_client_anm24 import PanelClientAnm24
 from .receptor_ip import ReceptorIPServer
 
 _LOGGER = logging.getLogger(__name__)
@@ -99,8 +101,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     connection_enabled = await async_load_connection_enabled(hass, entry.entry_id)
 
     family = entry.data["family"]
-    client: PanelClient | PanelClientAmt8000
-    if family == FAMILY_8000:
+    client: PanelClient | PanelClientAmt8000 | PanelClientAnm24
+    if family == FAMILY_ANM24_G2:
+        # Protocolo V2 com comandos proprios - ver protocol_anm24.py.
+        client = PanelClientAnm24(
+            entry.data["host"],
+            entry.data["port"],
+            entry.data[CONF_PASSWORD],
+            timeout=DEFAULT_REQUEST_TIMEOUT,
+            enabled=connection_enabled,
+        )
+    elif family == FAMILY_8000:
         # EXPERIMENTAL — ver protocol_amt8000.py e panel_client_amt8000.py.
         client = PanelClientAmt8000(
             entry.data["host"],

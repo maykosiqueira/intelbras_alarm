@@ -206,6 +206,11 @@ NACK_MESSAGES = {
 # ---------------------------------------------------------------------------
 FAMILY_2018 = "2018"  # usa comando 0x5A, status de 43 bytes, até 48 zonas
 FAMILY_4010 = "4010"  # usa comando 0x5B, status de até 54 bytes, até 64 zonas
+# A ANM 24 Net G2 (0x25) NAO fala o ISECMobile V1 das familias acima no acesso
+# local: ela ignora o 0x5A em silencio, sem devolver nem codigo de erro. Fala o
+# enquadramento V2 (o mesmo da AMT 8000), mas com comandos proprios - status em
+# 0x0B01, e o 0x0B4A da 8000 e recusado com NACK. Ver protocol_anm24.py.
+FAMILY_ANM24_G2 = "anm24g2"
 
 # ---------------------------------------------------------------------------
 # Tensão da fonte/bateria — comando 0xE7, sub-comando [1, 0x17] (achado e
@@ -236,6 +241,7 @@ VOLTAGE_OFFSETS: dict[str, tuple[int, int]] = {
 MODEL_2018_EG = "amt_2018_eg"
 MODEL_1016_NET = "amt_1016_net"
 MODEL_ANM24_NET = "anm_24_net"
+MODEL_ANM24_NET_G2 = "anm_24_net_g2"
 MODEL_2018_SMART = "amt_2018_smart"
 MODEL_4010_SMART = "amt_4010_smart"
 MODEL_2008_RF = "amt_2008_rf"
@@ -284,7 +290,11 @@ MODEL_TABLE: dict[int, tuple[str, str, str, int, int]] = {
     0x1E: (MODEL_2018_EG, "AMT 2018 E/EG", FAMILY_2018, 48, 2),
     0x61: (MODEL_1016_NET, "AMT 1016 NET", FAMILY_2018, 48, 2),
     0x24: (MODEL_ANM24_NET, "ANM 24 Net", FAMILY_2018, 48, 2),
-    0x25: (MODEL_ANM24_NET, "ANM 24 Net", FAMILY_2018, 48, 2),  # variante G2, mesma classe/nome no app oficial
+    # 0x25 confirmado em hardware real (firmware 1.0.3): fala V2, nao V1.
+    # O 0x24 (primeira geracao) segue na familia 2018 por falta de teste - a
+    # suposicao de que as duas geracoes se comportam igual foi exatamente o
+    # que deixou esta integracao muda nesta central.
+    0x25: (MODEL_ANM24_NET_G2, "ANM 24 Net G2", FAMILY_ANM24_G2, 24, 0),
     0x34: (MODEL_2018_SMART, "AMT 2018 E SMART", FAMILY_2018, 48, 2),
     0x41: (MODEL_4010_SMART, "AMT 4010 SMART", FAMILY_4010, 64, 4),
     0x04: (MODEL_GPRS_1000_UN, "GPRS 1000 UN", FAMILY_2018, 48, 2),
@@ -374,7 +384,7 @@ MODELS_SUPPORTING_STAY = {MODEL_4010_SMART, MODEL_2018_SMART, MODEL_AMT_8000}
 # do protocolo — ver MODEL_ZONE_COUNT para o nº de entidades por modelo,
 # que hoje coincide com este valor para todos os modelos suportados)
 # Não se aplica à AMT 8000 (FAMILY_8000, protocolo totalmente diferente).
-FAMILY_MAX_ZONES = {FAMILY_2018: 48, FAMILY_4010: 64, FAMILY_8000: AMT8000_ZONE_COUNT}
+FAMILY_MAX_ZONES = {FAMILY_2018: 48, FAMILY_4010: 64, FAMILY_8000: AMT8000_ZONE_COUNT, FAMILY_ANM24_G2: 24}
 FAMILY_STATUS_CMD = {FAMILY_2018: CMD_STATUS_PARTIAL, FAMILY_4010: CMD_STATUS_FULL}
 FAMILY_STATUS_LEN = {FAMILY_2018: 43, FAMILY_4010: 54}
 
@@ -382,7 +392,7 @@ FAMILY_STATUS_LEN = {FAMILY_2018: 43, FAMILY_4010: 54}
 # família 2018/1016 só reporta PGM1/PGM2 no status; a família 4010 reporta
 # PGM1-PGM3 no status principal e PGM4-PGM19 via expansores (Status53/54).
 # A AMT 8000 reporta só PGM1-PGM3 no blob de status (ver protocol_amt8000.py)
-FAMILY_PGM_COUNT = {FAMILY_2018: 2, FAMILY_4010: 19, FAMILY_8000: AMT8000_PGM_COUNT}
+FAMILY_PGM_COUNT = {FAMILY_2018: 2, FAMILY_4010: 19, FAMILY_8000: AMT8000_PGM_COUNT, FAMILY_ANM24_G2: 0}
 
 # Endereços do comando 0x50 para PGM 1..19 (31..43 em hexadecimal, doc 7.3)
 PGM_ADDRESSES = {i: 0x30 + i for i in range(1, 20)}  # PGM1=0x31 ... PGM19=0x43

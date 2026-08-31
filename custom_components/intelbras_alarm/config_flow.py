@@ -35,7 +35,7 @@ from .const import (
     OPT_POLLING_INTERVAL,
     parse_zone_spec,
 )
-from .coordinator import async_detect_amt8000, async_detect_model
+from .coordinator import async_detect_amt8000, async_detect_anm24, async_detect_model
 from .panel_client import PanelConnectionError
 from .panel_client_amt8000 import Amt8000AuthError, PanelConnectionErrorAmt8000
 from .protocol import NackError
@@ -47,6 +47,9 @@ _LOGGER = logging.getLogger(__name__)
 # docstring de coordinator.async_detect_amt8000 para o motivo de não
 # incluir esta família na sondagem automática).
 CONF_AMT8000_MODE = "amt8000_mode"
+# A ANM 24 Net G2 tambem nao pode passar pela sondagem automatica: ela ignora
+# o 0x5A do ISECMobile em silencio, entao a deteccao 2018/4010 nunca a acha.
+CONF_ANM24_G2_MODE = "anm24_g2_mode"
 
 STEP_USER_SCHEMA = vol.Schema(
     {
@@ -54,6 +57,7 @@ STEP_USER_SCHEMA = vol.Schema(
         vol.Required("port", default=DEFAULT_PORT): vol.Coerce(int),
         vol.Required(CONF_PASSWORD): str,
         vol.Optional(CONF_AMT8000_MODE, default=False): bool,
+        vol.Optional(CONF_ANM24_G2_MODE, default=False): bool,
         vol.Optional(CONF_CODE_REQUIRED_ARM, default=DEFAULT_CODE_REQUIRED_ARM): bool,
         vol.Optional(CONF_CODE_REQUIRED_DISARM, default=DEFAULT_CODE_REQUIRED_DISARM): bool,
         vol.Optional(CONF_ENABLED_ZONES, default=DEFAULT_ENABLED_ZONES_SPEC): str,
@@ -97,7 +101,12 @@ async def _validate_and_detect(hass: HomeAssistant, data: dict[str, Any]) -> dic
     # propagar para o chamador tratar.
     parse_zone_spec(data[CONF_ENABLED_ZONES])
 
-    if data.get(CONF_AMT8000_MODE):
+    if data.get(CONF_ANM24_G2_MODE):
+        # Protocolo local V2 com comandos proprios - ver protocol_anm24.py.
+        model_key, model_name, family = await async_detect_anm24(
+            data["host"], data["port"], password
+        )
+    elif data.get(CONF_AMT8000_MODE):
         # EXPERIMENTAL — ver coordinator.async_detect_amt8000. Não passa
         # pela sondagem automática 2018/4010 de propósito: são
         # protocolos de transporte incompatíveis (ver protocol_amt8000.py).

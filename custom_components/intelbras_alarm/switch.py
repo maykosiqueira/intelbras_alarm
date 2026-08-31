@@ -9,7 +9,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import IntelbrasAlarmData
-from .const import DOMAIN, FAMILY_8000, MANUFACTURER, PGM_ADDRESSES
+from .const import DOMAIN, FAMILY_8000, FAMILY_ANM24_G2, MANUFACTURER, PGM_ADDRESSES
 from .coordinator import IntelbrasAlarmCoordinator
 from .panel_client import PanelClient
 
@@ -22,11 +22,13 @@ async def async_setup_entry(
     client = data.client
 
     entities: list[SwitchEntity] = [IntelbrasConnectionSwitch(client, coordinator, entry)]
-    if coordinator.family != FAMILY_8000:
+    if coordinator.family not in (FAMILY_8000, FAMILY_ANM24_G2):
         # Nenhum comando de liga/desliga sirene foi confirmado para a AMT
-        # 8000 ainda (ver coordinator.async_set_siren) — a entidade não é
-        # criada para esta família, em vez de existir e sempre falhar.
+        # 8000 nem para a ANM 24 Net G2 — a entidade não é criada para essas
+        # famílias, em vez de existir e sempre falhar.
         entities.append(IntelbrasSirenSwitch(coordinator, entry))
+    if coordinator.family == FAMILY_ANM24_G2:
+        entities.append(IntelbrasBeepSwitch(coordinator, entry))
     for pgm in range(1, coordinator.pgm_count + 1):
         entities.append(IntelbrasPgmSwitch(coordinator, entry, pgm))
 
@@ -164,3 +166,57 @@ class IntelbrasConnectionSwitch(SwitchEntity):
         # continuava se reagendando sozinho, mesmo com cada tentativa
         # falhando instantaneamente).
         self._coordinator.pause_polling()
+
+
+class IntelbrasBeepSwitch(CoordinatorEntity[IntelbrasAlarmCoordinator], SwitchEntity):
+    """Bipe da sirene ao armar e desarmar (ANM 24 Net G2).
+
+    Essa configuração vive na programação da central, não no status: é lida
+    por ``0x351A`` e gravada por ``0x251A``. Como o valor só muda quando
+    alguém o grava — daqui ou pelo AMT Remoto — e cada consulta ocupa a única
+    sessão local que a central aceita por vez, a entidade lê ao ser criada e
+    depois a cada ciclo de atualização da plataforma, em vez de a cada poll de
+    status. Alteração feita pelo app aparece aqui no ciclo seguinte.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Bipe ao armar/desarmar"
+    _attr_icon = "mdi:volume-high"
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, coordinator: IntelbrasAlarmCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._entry = entry
+        self._attr_unique_id = f"{entry.entry_id}_beep_arme"
+        self._attr_device_info = _device_info(entry)
+        self._estado: bool | None = None
+
+    @property
+    def should_poll(self) -> bool:
+        return True
+
+    @property
+    def available(self) -> bool:
+        return self.coordinator.last_update_success and self._estado is not None
+
+    @property
+    def is_on(self) -> bool | None:
+        return self._estado
+
+    async def async_update(self) -> None:
+        try:
+            self._estado = await self.coordinator.async_read_beep()
+        except Exception:  # noqa: BLE001 - qualquer falha vira "indisponível"
+            # Não derruba a integração inteira por causa de uma configuração:
+            # a entidade fica indisponível e volta sozinha no próximo ciclo.
+            self._estado = None
+
+    async def async_turn_on(self, **kwargs: object) -> None:
+        await self.coordinator.async_set_beep(True)
+        self._estado = True
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs: object) -> None:
+        await self.coordinator.async_set_beep(False)
+        self._estado = False
+        self.async_write_ha_state()
