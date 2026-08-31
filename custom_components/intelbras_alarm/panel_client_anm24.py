@@ -51,7 +51,11 @@ class Anm24AuthError(Anm24ConnectionError):
 
 
 class PanelClientAnm24:
-    """Mantém uma conexão TCP persistente e autenticada com a ANM 24 Net G2."""
+    """Mantém uma conexão TCP persistente com a ANM 24 Net G2.
+
+    A senha só entra quando alguém manda alterar algo: leitura de status,
+    modelo, zonas e configuração funciona sem autenticar.
+    """
 
     def __init__(
         self,
@@ -96,7 +100,7 @@ class PanelClientAnm24:
 
     async def _close_locked(self) -> None:
         """Encerra a sessão avisando a central antes de derrubar o socket."""
-        if self._writer is not None and self._connected and self._authenticated:
+        if self._writer is not None and self._connected:
             try:
                 self._writer.write(cmd_disconnect())
                 await asyncio.wait_for(self._writer.drain(), timeout=2)
@@ -129,9 +133,20 @@ class PanelClientAnm24:
         await self._drain_stale_locked()
         await self._handshake_locked()
 
+    async def _ensure_authenticated_locked(self) -> None:
+        """Autentica sob demanda, na primeira escrita da sessão.
+
+        Ler status, modelo, zonas e configuração **não** exige senha nesta
+        central — só o prelúdio. Autenticar ao conectar faria a integração
+        inteira falhar com senha errada, inclusive a leitura, que funcionaria
+        perfeitamente; e o erro apareceria como "não conectou", longe da causa.
+        Adiando para a primeira escrita, o status continua vivo e a senha
+        errada reclama onde importa: no comando de armar ou desarmar.
+        """
+        if self._authenticated:
+            return
         auth = await self._send_v2_locked(cmd_auth(self._password), context="autenticação")
         if auth.opcode == NACK:
-            await self._close_locked()
             raise Anm24AuthError("Senha recusada pela central")
         self._authenticated = True
         _LOGGER.debug("ANM 24 G2: sessão autenticada")
@@ -170,14 +185,22 @@ class PanelClientAnm24:
                 f"A central não respondeu ao prelúdio de abertura: {err}"
             ) from err
 
-    async def send_command(self, frame: bytes, context: str | None = None) -> ParsedFrame:
-        """Envia um frame pronto e devolve a resposta, reconectando se preciso."""
+    async def send_command(
+        self, frame: bytes, context: str | None = None, requires_auth: bool = False
+    ) -> ParsedFrame:
+        """Envia um frame pronto e devolve a resposta, reconectando se preciso.
+
+        requires_auth só para comandos que **alteram** algo: a senha é
+        enviada uma vez por sessão, na primeira escrita.
+        """
         if not self._enabled:
             raise Anm24ConnectionError("Comunicação com a central está desativada")
 
         async with self._lock:
-            if not self._connected or not self._authenticated:
+            if not self._connected:
                 await self._connect_locked()
+            if requires_auth:
+                await self._ensure_authenticated_locked()
             return await self._send_v2_locked(frame, context=context)
 
     async def _send_v2_locked(self, frame: bytes, context: str | None = None) -> ParsedFrame:

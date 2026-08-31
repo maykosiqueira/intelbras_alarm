@@ -679,7 +679,9 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
     async def async_set_beep(self, enabled: bool) -> None:
         """Liga ou desliga o bipe de arme/desarme (0x251A)."""
         resposta = await self.client.send_command(
-            anm24.cmd_write_beep(enabled), context="gravacao do bipe de arme"
+            anm24.cmd_write_beep(enabled),
+            context="gravação do bipe de arme",
+            requires_auth=True,
         )
         if resposta.is_nack:
             raise HomeAssistantError("A central recusou a alteracao do bipe de arme")
@@ -1215,7 +1217,9 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
             self.last_command_frame_hex = frame.hex(" ").upper()
             self.async_update_listeners()
         try:
-            resposta = await self.client.send_command(frame, context=action_label)
+            resposta = await self.client.send_command(
+                frame, context=action_label, requires_auth=True
+            )
         except (*_ANY_PANEL_CONNECTION_ERROR, Anm24ConnectionError) as err:
             self.last_command_result = f"{action_label + ': ' if action_label else ''}{err}"
             if action_label:
