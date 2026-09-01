@@ -156,10 +156,15 @@ class IntelbrasAlarmConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors["base"] = "cannot_connect"
             except PanelConnectionErrorAmt8000:
                 errors["base"] = "cannot_connect"
-            except Anm24ConnectionError:
+            except Anm24ConnectionError as err:
                 # Inclui Anm24AuthError, que herda desta. A causa mais comum
-                # aqui não é rede: a central atende uma sessão local por vez,
-                # então o AMT Remoto aberto no celular faz a detecção expirar.
+                # aqui não é rede: a central atende uma sessão local por vez e
+                # precisa de alguns segundos de carência entre elas, então o
+                # AMT Remoto aberto — ou uma tentativa anterior deste próprio
+                # formulário — faz a detecção expirar. Registra o motivo em
+                # WARNING: sem isso a falha vira uma mensagem genérica na tela
+                # e nada no log, que é o pior dos dois mundos para diagnosticar.
+                _LOGGER.warning("Detecção da ANM 24 Net G2 falhou: %s", err)
                 errors["base"] = "cannot_connect"
             except UpdateFailed:
                 errors["base"] = "cannot_connect"
