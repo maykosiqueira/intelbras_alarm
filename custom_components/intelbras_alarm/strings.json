@@ -14,7 +14,8 @@
           "enabled_zones": "Zonas habilitadas por padrão",
           "receptor_ip_enabled": "Habilitar recepção de eventos (Receptor IP)",
           "receptor_ip_port": "Porta de escuta do Receptor IP",
-          "legacy_eeprom_password": "Senha acesso App AMT Remoto (6 dígitos, opcional)"
+          "legacy_eeprom_password": "Senha acesso App AMT Remoto (6 dígitos, opcional)",
+          "anm24_g2_mode": "ANM 24 Net G2 (protocolo local)"
         },
         "data_description": {
           "amt8000_mode": "Marque somente se sua central for uma AMT 8000 — usa um protocolo próprio ainda em desenvolvimento e teste (ver README_DETALHADO.md, seção \"AMT 8000 (experimental)\"). Deixe desmarcado para os demais modelos (2018/1016/4010), que continuam com detecção automática.",
@@ -23,7 +24,8 @@
           "enabled_zones": "Formato: intervalos e/ou números separados por ; (ex.: 1-5;8;10-15). As zonas fora dessa lista continuam existindo, só ficam desabilitadas até você ativá-las manualmente em Configurações → Entidades.",
           "receptor_ip_enabled": "Desmarcado (padrão): desligado, nenhuma porta é aberta. Marcado: a central pode se conectar aqui e empurrar eventos em tempo real — precisa configurar a central separadamente (fora desta tela) apontando para o IP do Home Assistant e a porta abaixo. Veja o README para o passo a passo completo.",
           "receptor_ip_port": "Porta em que o Home Assistant vai ficar esperando a central se conectar (não confundir com a porta da central, acima) — precisa ser a mesma configurada na central. Só importa se a opção acima estiver marcada.",
-          "legacy_eeprom_password": "Deixe em branco (padrão) para não usar. Só é necessária se o seu modelo/firmware NÃO aparecer na lista de \"nomes de zona e log de eventos\" do README (ex.: AMT 1016 NET com firmware antigo), ou para realizar a leitura de informação tensão de bateria e fonte. É a mesma senha de 6 dígitos (\"Senha Acesso Remoto\")."
+          "legacy_eeprom_password": "Deixe em branco (padrão) para não usar. Só é necessária se o seu modelo/firmware NÃO aparecer na lista de \"nomes de zona e log de eventos\" do README (ex.: AMT 1016 NET com firmware antigo), ou para realizar a leitura de informação tensão de bateria e fonte. É a mesma senha de 6 dígitos (\"Senha Acesso Remoto\").",
+          "anm24_g2_mode": "Marque se sua central for uma ANM 24 Net G2. Ela não responde à detecção automática: usa um protocolo local próprio, diferente dos modelos 2018/1016/4010. Atende uma sessão local por vez — feche o AMT Remoto antes de conectar."
         }
       },
       "partition_passwords": {

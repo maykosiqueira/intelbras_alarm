@@ -36,6 +36,7 @@ from .const import (
     parse_zone_spec,
 )
 from .coordinator import async_detect_amt8000, async_detect_anm24, async_detect_model
+from .panel_client_anm24 import Anm24ConnectionError
 from .panel_client import PanelConnectionError
 from .panel_client_amt8000 import Amt8000AuthError, PanelConnectionErrorAmt8000
 from .protocol import NackError
@@ -154,6 +155,11 @@ class IntelbrasAlarmConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             except PanelConnectionError:
                 errors["base"] = "cannot_connect"
             except PanelConnectionErrorAmt8000:
+                errors["base"] = "cannot_connect"
+            except Anm24ConnectionError:
+                # Inclui Anm24AuthError, que herda desta. A causa mais comum
+                # aqui não é rede: a central atende uma sessão local por vez,
+                # então o AMT Remoto aberto no celular faz a detecção expirar.
                 errors["base"] = "cannot_connect"
             except UpdateFailed:
                 errors["base"] = "cannot_connect"
