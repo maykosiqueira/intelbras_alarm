@@ -125,11 +125,15 @@ def parse_frame(raw: bytes) -> ParsedFrame:
     if len(raw) < 9:
         raise Anm24ProtocolError(f"Frame curto demais: {len(raw)} bytes")
     length = (raw[4] << 8) | raw[5]
-    fim = 6 + length
-    if fim + 1 > len(raw):
+    if 6 + length > len(raw):
         raise Anm24ProtocolError(
-            f"Frame truncado: cabeçalho anuncia {length} bytes de corpo, chegaram {len(raw) - 7}"
+            f"Frame truncado: cabeçalho anuncia {length} bytes de corpo, chegaram {len(raw) - 6}"
         )
+    # O tamanho declarado não diz se o checksum está dentro ou fora dele: no
+    # hardware, 0x0060 responde 6+9+1=16 bytes (fora) e 0x0B01 responde
+    # 6+52=58 (dentro). Quem decide é o próprio checksum, que é o último byte
+    # do que chegou em ambos os casos.
+    fim = len(raw) - 1
     return ParsedFrame(
         opcode=(raw[6], raw[7]),
         content=raw[8:fim],

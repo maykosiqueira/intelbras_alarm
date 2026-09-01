@@ -30,6 +30,7 @@ from .protocol_anm24 import (
     NACK,
     Anm24ProtocolError,
     ParsedFrame,
+    checksum,
     cmd_auth,
     cmd_disconnect,
     parse_frame,
@@ -248,10 +249,23 @@ class PanelClientAnm24:
                 self._reader.readexactly(6), timeout=self._timeout
             )
             tamanho = (cabecalho[4] << 8) | cabecalho[5]
-            resto = await asyncio.wait_for(
-                self._reader.readexactly(tamanho + 1), timeout=self._timeout
+            corpo = await asyncio.wait_for(
+                self._reader.readexactly(tamanho), timeout=self._timeout
             )
-            raw = cabecalho + resto
+            raw = cabecalho + corpo
+            # O tamanho declarado não localiza o checksum de forma confiável:
+            # medido no hardware, a resposta de 0x0060 traz o checksum DEPOIS
+            # dos bytes declarados (6+9+1=16) e a de 0x0B01 traz DENTRO deles
+            # (6+52=58). Pedir sempre um byte a mais trava a leitura do status
+            # esperando algo que nunca chega — e o erro é invisível para o
+            # checksum, porque o miolo do status é todo 0x00 e XOR com zero não
+            # muda nada. Por isso a decisão é pelo próprio checksum: se ele já
+            # fecha aqui, o frame acabou; senão, o último byte ainda vem.
+            if checksum(raw[:-1]) != raw[-1]:
+                extra = await asyncio.wait_for(
+                    self._reader.readexactly(1), timeout=self._timeout
+                )
+                raw += extra
         except asyncio.TimeoutError as err:
             await self._close_locked()
             raise Anm24ConnectionError(
