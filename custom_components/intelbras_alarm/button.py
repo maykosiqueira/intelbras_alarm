@@ -8,7 +8,15 @@ from homeassistant.helpers.entity import DeviceInfo, EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from . import IntelbrasAlarmData
-from .const import DOMAIN, MANUFACTURER, PANIC_AUDIBLE, PANIC_FIRE, PANIC_MEDICAL, PANIC_SILENT
+from .const import (
+    DOMAIN,
+    FAMILY_ANM24_G2,
+    MANUFACTURER,
+    PANIC_AUDIBLE,
+    PANIC_FIRE,
+    PANIC_MEDICAL,
+    PANIC_SILENT,
+)
 from .coordinator import IntelbrasAlarmCoordinator
 
 PANIC_BUTTONS = (
@@ -24,6 +32,17 @@ async def async_setup_entry(
 ) -> None:
     data: IntelbrasAlarmData = hass.data[DOMAIN][entry.entry_id]
     coordinator = data.coordinator
+
+    # Panico (0x45) e anulacao de zona sao comandos da familia 2018/4010 e
+    # seguem o enquadramento V1. A ANM 24 Net G2 fala V2 numa sessao local
+    # unica e persistente: enviar um frame V1 por ali e, na melhor hipotese,
+    # um comando ignorado, e na pior um comando de panico com efeito
+    # desconhecido numa central de alarme ligada - alem de atrapalhar a sessao
+    # que a leitura de status usa. Enquanto nao houver captura confirmando o
+    # equivalente V2 desses comandos, esta familia nao os oferece, pelo mesmo
+    # criterio que ja mantem o armar parcial fora da UI dela.
+    if coordinator.family == FAMILY_ANM24_G2:
+        return
 
     entities: list[ButtonEntity] = [
         IntelbrasPanicButton(coordinator, entry, key, name, code, icon)

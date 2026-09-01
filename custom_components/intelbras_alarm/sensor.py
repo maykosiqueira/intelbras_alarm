@@ -14,6 +14,7 @@ from .const import (
     CONF_RECEPTOR_IP_ENABLED,
     DEFAULT_RECEPTOR_IP_ENABLED,
     DOMAIN,
+    FAMILY_ANM24_G2,
     MANUFACTURER,
     MODEL_2018_SMART,
 )
@@ -25,6 +26,22 @@ async def async_setup_entry(
 ) -> None:
     data: IntelbrasAlarmData = hass.data[DOMAIN][entry.entry_id]
     coordinator = data.coordinator
+    # Bateria e contagens de zona nao sao informadas pela ANM 24 Net G2 na
+    # consulta 0x0B01 (ver protocol_anm24.build_panel_status). Publica-las
+    # mostraria "0 %" de bateria e "0 zonas abertas" como se fossem leituras,
+    # quando na verdade sao o valor de preenchimento de um campo que a central
+    # nao respondeu. O sensor de resultado do ultimo comando continua, porque
+    # ele reflete o que a propria integracao enviou, nao o que a central diz.
+    if coordinator.family == FAMILY_ANM24_G2:
+        async_add_entities(
+            [
+                IntelbrasLastCommandResultSensor(coordinator, entry),
+                IntelbrasReceptorLastEventSensor(coordinator, entry),
+                IntelbrasReceptorHeartbeatSensor(coordinator, entry),
+            ]
+        )
+        return
+
     entities = [
         IntelbrasBatterySensor(coordinator, entry),
         IntelbrasZoneCountSensor(

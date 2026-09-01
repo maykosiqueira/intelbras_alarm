@@ -386,6 +386,12 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
         """
         if self.supports_extended_eeprom:
             return False
+        # A ANM 24 Net G2 nao tem o caminho de EEPROM legada: o comando 0xE7
+        # pertence ao enquadramento V1. Sem esta condicao, bastaria haver uma
+        # senha de 6 digitos guardada na configuracao para a leitura de
+        # eventos tentar o caminho V1 nesta central.
+        if self.family == FAMILY_ANM24_G2:
+            return False
         return self._legacy_eeprom_password is not None
 
     @property
@@ -942,7 +948,27 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
         await self._send_and_check(frame, label)
         await self.async_request_refresh()
 
+    def _recusar_v1_na_anm24(self, operacao: str) -> None:
+        """Barra operacoes que so existem no enquadramento V1 nesta central.
+
+        Panico, anulacao de zona e leitura de log por EEPROM sao comandos das
+        familias 2018/4010. A ANM 24 Net G2 fala V2 numa sessao local unica e
+        persistente: um frame V1 escrito ali nao e entendido pela central e
+        ainda desalinha a sessao de onde sai a leitura de status. Recusar com
+        mensagem clara e melhor do que enviar e torcer - ainda mais em panico,
+        onde o efeito de um comando mal formado numa central de alarme ligada
+        e desconhecido.
+        """
+        if self.family == FAMILY_ANM24_G2:
+            raise HomeAssistantError(
+                f"{operacao} nao e suportado na ANM 24 Net G2 pela integracao: "
+                "o comando existe apenas no protocolo das familias 2018/4010 e "
+                "o equivalente no protocolo V2 desta central ainda nao foi "
+                "identificado."
+            )
+
     async def async_panic(self, kind: int) -> None:
+        self._recusar_v1_na_anm24("Panico")
         if self.family == FAMILY_8000:
             frame = amt8000.cmd_panic(kind)
             label = f"Pânico ({_PANIC_LABELS.get(kind, f'0x{kind:02X}')})"
@@ -970,6 +996,7 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
         ``replace=True`` para enviar exatamente o conjunto informado
         (desanulando qualquer zona fora dele).
         """
+        self._recusar_v1_na_anm24("Anular zona")
         if self.family == FAMILY_8000:
             for zone in sorted(zones_to_bypass):
                 frame = amt8000.cmd_bypass(zone, True)
@@ -1031,6 +1058,7 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
 
     async def async_clear_bypass(self) -> None:
         """Remove todas as anulações, reativando todas as zonas."""
+        self._recusar_v1_na_anm24("Remover anulacao de zona")
         if self.family == FAMILY_8000:
             if self.data is not None:
                 bypassed = {z for z, b in self.data.zones_bypassed.items() if b}
@@ -1053,6 +1081,7 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
         ``async_bypass_zones``), então este loop é natural, não uma
         adaptação.
         """
+        self._recusar_v1_na_anm24("Reativar zona")
         if self.family == FAMILY_8000:
             for zone in sorted(zones):
                 frame = amt8000.cmd_bypass(zone, False)

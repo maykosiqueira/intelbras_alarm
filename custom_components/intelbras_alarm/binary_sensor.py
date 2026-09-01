@@ -13,7 +13,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import IntelbrasAlarmData
-from .const import DOMAIN, MANUFACTURER
+from .const import DOMAIN, FAMILY_ANM24_G2, MANUFACTURER
 from .coordinator import IntelbrasAlarmCoordinator
 
 DIAGNOSTIC_SENSORS: tuple[BinarySensorEntityDescription, ...] = (
@@ -100,6 +100,18 @@ async def async_setup_entry(
 ) -> None:
     data: IntelbrasAlarmData = hass.data[DOMAIN][entry.entry_id]
     coordinator = data.coordinator
+
+    # A ANM 24 Net G2 nao expoe sensor binario nenhum: a unica informacao que
+    # a consulta 0x0B01 traz e se a central esta armada, e isso ja e o painel
+    # de alarme. Rede eletrica, bateria, sirene, tamper, teclado, receptor e
+    # estado de zona nao vem nessa resposta (ver protocol_anm24.
+    # build_panel_status) - criar as entidades assim mesmo publicaria "off"
+    # em todas, e "off" num sensor de problema significa "esta tudo bem", que
+    # e uma afirmacao diferente de "nao sei". Uma automacao de bateria fraca
+    # ligada a um sensor desses nunca dispararia, e o usuario so descobriria
+    # no dia em que precisasse dela.
+    if coordinator.family == FAMILY_ANM24_G2:
+        return
 
     entities: list[BinarySensorEntity] = [
         IntelbrasDiagnosticBinarySensor(coordinator, entry, description)
