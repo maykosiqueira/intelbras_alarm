@@ -94,6 +94,30 @@ _LOGGER = logging.getLogger(__name__)
 _ANY_PANEL_CONNECTION_ERROR = (PanelConnectionError, PanelConnectionErrorAmt8000, Amt8000AuthError)
 
 
+# A ANM 24 Net G2 atende uma sessao local por vez e precisa de segundos de
+# carencia entre elas. O padrao de 0,25 s (4 consultas por segundo), calibrado
+# para a familia 2018, a tranca: cada falha fecha a conexao e 250 ms depois vem
+# outra tentativa, entao a central nunca tem o intervalo de silencio de que
+# precisa para liberar - e a integracao se bloqueia sozinha, indefinidamente.
+#
+# Nao e conservadorismo: com a sessao livre ela responde em ~23 ms, entao um
+# segundo ja da folga de sobra. O piso existe para o caso de falha, nao para o
+# caso feliz.
+FAMILY_MIN_POLLING_INTERVAL = {FAMILY_ANM24_G2: 2.0}
+
+
+def _polling_interval_for(family: str, configurado: float) -> float:
+    """Intervalo de consulta, respeitando o piso da familia."""
+    piso = FAMILY_MIN_POLLING_INTERVAL.get(family)
+    if piso is not None and configurado < piso:
+        _LOGGER.debug(
+            "Familia %s exige no minimo %.1fs entre consultas; %.2fs configurado foi elevado",
+            family, piso, configurado,
+        )
+        return piso
+    return configurado
+
+
 class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
     """Consulta o status da central periodicamente e expõe comandos de alto nível."""
 
@@ -228,7 +252,9 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
             hass,
             _LOGGER,
             name=f"Intelbras Alarm ({entry.title})",
-            update_interval=timedelta(seconds=entry.options.get("polling_interval", 0.25)),
+            update_interval=timedelta(
+                seconds=_polling_interval_for(family, entry.options.get("polling_interval", 0.25))
+            ),
         )
         # Guardado à parte pra poder restaurar depois de pause_polling()
         # (ver logo abaixo) — self.update_interval pode ser zerado
