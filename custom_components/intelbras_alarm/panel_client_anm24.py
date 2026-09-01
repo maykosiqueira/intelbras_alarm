@@ -41,6 +41,17 @@ _LOGGER = logging.getLogger(__name__)
 # propósito: é lixo do passado, não vale segurar a partida por causa dele.
 _DRAIN_TIMEOUT = 0.4
 
+# A central atende uma sessao local por vez e leva alguns segundos para
+# liberar depois que a anterior fecha - mesmo com o 0xF0F1 enviado e o ACK
+# recebido. Nesse intervalo ela ACEITA o TCP e nao responde ao preludio, o que
+# de fora e indistinguivel de central fora do ar.
+#
+# Isso nao e teorico: a deteccao do modelo abre uma sessao e fecha, e o
+# primeiro poll do coordinator vem logo atras - direto na carencia. Sem
+# repetir, a integracao nasce falhando na propria configuracao.
+_CONNECT_RETRIES = 3
+_CONNECT_RETRY_DELAY = 5.0
+
 
 class Anm24ConnectionError(Exception):
     """Falha ao conectar, autenticar ou comunicar com a ANM 24 Net G2."""
@@ -118,6 +129,25 @@ class PanelClientAnm24:
         self._writer = None
 
     async def _connect_locked(self) -> None:
+        """Abre a sessao, repetindo enquanto a central estiver em carencia."""
+        ultima: Exception | None = None
+        for tentativa in range(1, _CONNECT_RETRIES + 1):
+            try:
+                await self._abrir_sessao_locked()
+                return
+            except Anm24ConnectionError as err:
+                ultima = err
+                if tentativa < _CONNECT_RETRIES:
+                    _LOGGER.debug(
+                        "ANM 24 G2: tentativa %d de %d falhou (%s); a central pode estar "
+                        "em carencia entre sessoes, tentando de novo em %.0fs",
+                        tentativa, _CONNECT_RETRIES, err, _CONNECT_RETRY_DELAY,
+                    )
+                    await asyncio.sleep(_CONNECT_RETRY_DELAY)
+        assert ultima is not None
+        raise ultima
+
+    async def _abrir_sessao_locked(self) -> None:
         try:
             self._reader, self._writer = await asyncio.wait_for(
                 asyncio.open_connection(self._host, self._port), timeout=self._timeout
