@@ -40,7 +40,14 @@ _LOGGER = logging.getLogger(__name__)
 
 # Tempo dado à central para despejar respostas atrasadas ao conectar. Curto de
 # propósito: é lixo do passado, não vale segurar a partida por causa dele.
-_DRAIN_TIMEOUT = 0.4
+_DRAIN_TIMEOUT = 1.5
+
+# Quantos frames fora de ordem descartar antes de desistir de ressincronizar.
+# Medido no hardware: a resposta atrasada de uma sessao chega na SEGUINTE, ja
+# depois do preludio - o dreno da abertura nao alcanca todas. Sem descartar e
+# reler, cada resposta passa a responder a pergunta anterior e a leitura fica
+# permanentemente deslocada, entregando dado velho como se fosse atual.
+_MAX_FRAMES_FORA_DE_ORDEM = 4
 
 # A central atende uma sessao local por vez e leva alguns segundos para
 # liberar depois que a anterior fecha - mesmo com o 0xF0F1 enviado e o ACK
@@ -217,7 +224,11 @@ class PanelClientAnm24:
             ) from err
 
     async def send_command(
-        self, frame: bytes, context: str | None = None, requires_auth: bool = False
+        self,
+        frame: bytes,
+        context: str | None = None,
+        requires_auth: bool = False,
+        expected_opcode: tuple[int, int] | None = None,
     ) -> ParsedFrame:
         """Envia um frame pronto e devolve a resposta, reconectando se preciso.
 
@@ -232,66 +243,111 @@ class PanelClientAnm24:
                 await self._connect_locked()
             if requires_auth:
                 await self._ensure_authenticated_locked()
-            return await self._send_v2_locked(frame, context=context)
+            return await self._send_v2_locked(
+                frame, context=context, expected_opcode=expected_opcode
+            )
 
-    async def _send_v2_locked(self, frame: bytes, context: str | None = None) -> ParsedFrame:
-        """Envia ``frame`` e lê a resposta — assume o lock já adquirido."""
+    async def _send_v2_locked(
+        self,
+        frame: bytes,
+        context: str | None = None,
+        expected_opcode: tuple[int, int] | None = None,
+    ) -> ParsedFrame:
+        """Envia ``frame`` e lê a resposta — assume o lock já adquirido.
+
+        Quando ``expected_opcode`` é informado, um frame com outro opcode é
+        resposta atrasada de uma pergunta anterior: ele é descartado e a
+        leitura continua. Aceitá-lo entregaria a resposta da pergunta errada,
+        e a partir dali toda leitura ficaria deslocada em uma posição — o
+        status exibido seria sempre o da consulta anterior, sem nada indicando
+        que está velho. Medido no hardware: a resposta pendente de uma sessão
+        chega na sessão SEGUINTE, depois do prelúdio, fora do alcance do dreno
+        de abertura.
+        """
         rotulo = f" [{context}]" if context else ""
         assert self._reader is not None and self._writer is not None
+
         try:
             _LOGGER.debug("ANM 24 G2: enviando%s: %s", rotulo, frame.hex(" ").upper())
             self._writer.write(frame)
             await self._writer.drain()
-
-            # Cabeçalho fixo de 6 bytes; o tamanho do corpo vem nos dois
-            # últimos, e a partir dele sabemos quanto ainda falta ler.
-            cabecalho = await asyncio.wait_for(
-                self._reader.readexactly(6), timeout=self._timeout
-            )
-            tamanho = (cabecalho[4] << 8) | cabecalho[5]
-            corpo = await asyncio.wait_for(
-                self._reader.readexactly(tamanho), timeout=self._timeout
-            )
-            raw = cabecalho + corpo
-            # O tamanho declarado não localiza o checksum de forma confiável:
-            # medido no hardware, a resposta de 0x0060 traz o checksum DEPOIS
-            # dos bytes declarados (6+9+1=16) e a de 0x0B01 traz DENTRO deles
-            # (6+52=58). Pedir sempre um byte a mais trava a leitura do status
-            # esperando algo que nunca chega — e o erro é invisível para o
-            # checksum, porque o miolo do status é todo 0x00 e XOR com zero não
-            # muda nada. Por isso a decisão é pelo próprio checksum: se ele já
-            # fecha aqui, o frame acabou; senão, o último byte ainda vem.
-            if checksum(raw[:-1]) != raw[-1]:
-                extra = await asyncio.wait_for(
-                    self._reader.readexactly(1), timeout=self._timeout
-                )
-                raw += extra
-        except asyncio.TimeoutError as err:
-            await self._close_locked()
-            raise Anm24ConnectionError(
-                f"Falha de comunicação com a central{rotulo}: tempo limite de "
-                f"{self._timeout}s excedido"
-            ) from err
-        except asyncio.IncompleteReadError as err:
-            await self._close_locked()
-            raise Anm24ConnectionError(
-                f"Falha de comunicação com a central{rotulo}: conexão encerrada antes "
-                f"da resposta completa (esperado {err.expected}, recebido "
-                f"{len(err.partial)} bytes)"
-            ) from err
         except OSError as err:
             await self._close_locked()
             raise Anm24ConnectionError(
                 f"Falha de comunicação com a central{rotulo}: {err or err.__class__.__name__}"
             ) from err
 
-        try:
-            resposta = parse_frame(raw)
-        except Anm24ProtocolError as err:
-            raise Anm24ConnectionError(f"{err}{rotulo}") from err
+        descartados = 0
+        while True:
+            try:
+                # Cabeçalho fixo de 6 bytes; o tamanho do corpo vem nos dois
+                # últimos, e a partir dele sabemos quanto ainda falta ler.
+                cabecalho = await asyncio.wait_for(
+                    self._reader.readexactly(6), timeout=self._timeout
+                )
+                tamanho = (cabecalho[4] << 8) | cabecalho[5]
+                corpo = await asyncio.wait_for(
+                    self._reader.readexactly(tamanho), timeout=self._timeout
+                )
+                raw = cabecalho + corpo
+                # O tamanho declarado não localiza o checksum de forma
+                # confiável: medido no hardware, a resposta de 0x0060 traz o
+                # checksum DEPOIS dos bytes declarados (6+9+1=16) e a de 0x0B01
+                # traz DENTRO deles (6+52=58). Pedir sempre um byte a mais trava
+                # a leitura do status esperando algo que nunca chega — e o erro é
+                # invisível para o checksum, porque o miolo do status é todo
+                # 0x00 e XOR com zero não muda nada. Por isso a decisão é pelo
+                # próprio checksum: se ele já fecha aqui, o frame acabou; senão,
+                # o último byte ainda vem.
+                if checksum(raw[:-1]) != raw[-1]:
+                    extra = await asyncio.wait_for(
+                        self._reader.readexactly(1), timeout=self._timeout
+                    )
+                    raw += extra
+            except asyncio.TimeoutError as err:
+                await self._close_locked()
+                raise Anm24ConnectionError(
+                    f"Falha de comunicação com a central{rotulo}: tempo limite de "
+                    f"{self._timeout}s excedido"
+                ) from err
+            except asyncio.IncompleteReadError as err:
+                await self._close_locked()
+                raise Anm24ConnectionError(
+                    f"Falha de comunicação com a central{rotulo}: conexão encerrada antes "
+                    f"da resposta completa (esperado {err.expected}, recebido "
+                    f"{len(err.partial)} bytes)"
+                ) from err
+            except OSError as err:
+                await self._close_locked()
+                raise Anm24ConnectionError(
+                    f"Falha de comunicação com a central{rotulo}: {err or err.__class__.__name__}"
+                ) from err
 
-        if not resposta.valid_checksum:
-            _LOGGER.warning(
-                "ANM 24 G2: checksum inválido na resposta%s: %s", rotulo, raw.hex(" ").upper()
-            )
-        return resposta
+            try:
+                resposta = parse_frame(raw)
+            except Anm24ProtocolError as err:
+                raise Anm24ConnectionError(f"{err}{rotulo}") from err
+
+            if not resposta.valid_checksum:
+                _LOGGER.warning(
+                    "ANM 24 G2: checksum inválido na resposta%s: %s",
+                    rotulo, raw.hex(" ").upper(),
+                )
+
+            if expected_opcode is not None and resposta.opcode not in (expected_opcode, NACK):
+                if descartados >= _MAX_FRAMES_FORA_DE_ORDEM:
+                    await self._close_locked()
+                    raise Anm24ConnectionError(
+                        f"Não foi possível ressincronizar a leitura{rotulo}: "
+                        f"{descartados + 1} respostas seguidas de outros comandos"
+                    )
+                _LOGGER.debug(
+                    "ANM 24 G2: descartando resposta atrasada%s (esperado %02X %02X, "
+                    "veio %02X %02X): %s",
+                    rotulo, expected_opcode[0], expected_opcode[1],
+                    resposta.opcode[0], resposta.opcode[1], raw.hex(" ").upper(),
+                )
+                descartados += 1
+                continue
+
+            return resposta

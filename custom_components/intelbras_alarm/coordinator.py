@@ -994,7 +994,9 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
         try:
             if self._anm24_firmware is None:
                 info = await self.client.send_command(
-                    anm24.cmd_model(), context="modelo/firmware (ANM 24 G2)"
+                    anm24.cmd_model(),
+                    context="modelo/firmware (ANM 24 G2)",
+                    expected_opcode=anm24.CMD_MODEL,
                 )
                 codigo, self._anm24_firmware = anm24.parse_model(info.content)
                 # O nome vem da tabela do projeto, não de um literal aqui: se
@@ -1005,7 +1007,9 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
                 )[1]
 
             resposta = await self.client.send_command(
-                anm24.cmd_status(), context="consulta de status (ANM 24 G2)"
+                anm24.cmd_status(),
+                context="consulta de status (ANM 24 G2)",
+                expected_opcode=anm24.CMD_STATUS,
             )
             if resposta.is_nack:
                 raise UpdateFailed("A central recusou o comando de status (NACK)")
@@ -1065,7 +1069,9 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
     async def async_read_beep(self) -> bool:
         """Le o bipe de arme/desarme (0x351A)."""
         resposta = await self.client.send_command(
-            anm24.cmd_read_beep(), context="leitura do bipe de arme"
+            anm24.cmd_read_beep(),
+            context="leitura do bipe de arme",
+            expected_opcode=anm24.CMD_READ_BEEP,
         )
         return anm24.parse_beep(resposta.content)
 
@@ -1666,7 +1672,15 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
             self.async_update_listeners()
         try:
             resposta = await self.client.send_command(
-                frame, context=action_label, requires_auth=True
+                frame,
+                context=action_label,
+                requires_auth=True,
+                # O opcode esperado sai do próprio frame enviado (bytes 6 e 7):
+                # esta central ecoa o comando na resposta, então qualquer outro
+                # opcode é resposta atrasada de uma pergunta anterior. Aceitar
+                # uma dessas aqui seria pior do que na leitura — daria um arme
+                # ou desarme por confirmado com base na resposta de outra coisa.
+                expected_opcode=(frame[6], frame[7]),
             )
         except (*_ANY_PANEL_CONNECTION_ERROR, Anm24ConnectionError) as err:
             self.last_command_result = f"{action_label + ': ' if action_label else ''}{err}"
@@ -2529,7 +2543,11 @@ async def async_detect_anm24(host: str, port: int, password: str) -> tuple[str, 
 
     client = PanelClientAnm24(host, port, password, timeout=DEFAULT_REQUEST_TIMEOUT)
     try:
-        resposta = await client.send_command(anm24.cmd_model(), context="detecção do modelo")
+        resposta = await client.send_command(
+            anm24.cmd_model(),
+            context="detecção do modelo",
+            expected_opcode=anm24.CMD_MODEL,
+        )
         codigo, firmware = anm24.parse_model(resposta.content)
         entrada = MODEL_TABLE.get(codigo)
         if entrada is None or entrada[2] != FAMILY_ANM24_G2:
