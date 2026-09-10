@@ -107,7 +107,15 @@ _ANY_PANEL_CONNECTION_ERROR = (PanelConnectionError, PanelConnectionErrorAmt8000
 # Nao e conservadorismo: com a sessao livre ela responde em ~23 ms, entao um
 # segundo ja da folga de sobra. O piso existe para o caso de falha, nao para o
 # caso feliz.
-FAMILY_MIN_POLLING_INTERVAL = {FAMILY_ANM24_G2: 2.0}
+# Piso de intervalo entre consultas, por familia.
+#
+# A ANM 24 Net G2 pede 30s, e nao e conservadorismo: medido no hardware, uma
+# sessao local responde DUAS consultas de status e emudece na terceira, e a
+# central so libera a sessao seguinte se a anterior for encerrada com 0xF0F1.
+# Consultar de 2 em 2 segundos numa sessao mantida aberta rende uma leitura boa
+# ao subir e silencio depois -- foi assim que a integracao passou dias parecendo
+# viva e sem atualizar nada.
+FAMILY_MIN_POLLING_INTERVAL = {FAMILY_ANM24_G2: 30.0}
 
 
 def _polling_interval_for(family: str, configurado: float) -> float:
@@ -1003,8 +1011,23 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
                 raise UpdateFailed("A central recusou o comando de status (NACK)")
             if not resposta.valid_checksum:
                 raise UpdateFailed("Checksum invalido na resposta de status")
+            # A resposta precisa ser do comando que foi pedido. Quando a sessao
+            # se esgota, esta central responde um ACK vazio (0xF0FE) no lugar do
+            # status -- e um ACK tem conteudo de zero bytes, entao entregar isso
+            # ao parser produz "Status curto demais: 0 bytes", que aponta para o
+            # formato do frame quando o problema real e a sessao acabada.
+            if resposta.opcode != anm24.CMD_STATUS:
+                raise UpdateFailed(
+                    "A central respondeu ao status com o opcode "
+                    f"{resposta.opcode[0]:#04x} {resposta.opcode[1]:#04x}"
+                    + (" (ACK vazio: a sessao local se esgotou)" if resposta.is_ack else "")
+                )
             bruto = anm24.parse_status(resposta.content)
         except (*_ANY_PANEL_CONNECTION_ERROR, Anm24ConnectionError, UpdateFailed, IndexError, ValueError) as err:
+            # Uma sessao que falhou no meio nao serve para a proxima consulta:
+            # a central so a libera com o 0xF0F1, e sem isso as tentativas
+            # seguintes caem todas no vazio.
+            await self.client.disconnect()
             self._handle_poll_failure(err)
             if self.data is not None:
                 return self.data
@@ -1023,6 +1046,13 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
             )
             self._poll_failure_logged = False
         self._last_poll_success_monotonic = time.monotonic()
+
+        # Encerra a sessao assim que o ciclo termina. Manter aberta nao poupa
+        # nada nesta central: ela para de responder depois da segunda consulta,
+        # e a unica forma de liberar e o 0xF0F1 que disconnect() envia. Fechar
+        # aqui faz cada ciclo comecar com uma sessao inteira disponivel, que e o
+        # unico regime em que a leitura se sustenta.
+        await self.client.disconnect()
 
         return anm24.build_panel_status(
             bruto,
