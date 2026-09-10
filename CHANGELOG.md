@@ -8,7 +8,500 @@ O histórico de desenvolvimento anterior a esta versão (v1.6.0–v1.8.3) foi
 consolidado na entrada v2.0.0; a partir daqui, toda mudança relevante é
 registrada aqui antes de cada release.
 
+## [2.1.1-beta]
+
+### Corrigido — pausa de acomodação após consulta de tensão não protegia mais nada (analisado por revisor externo)
+
+Um usuário compartilhou uma análise externa comparando esta versão
+contra uma versão própria já testada, apontando algo específico:
+`await asyncio.sleep(1.0)` em `async_refresh_voltage()` tinha ficado,
+ao longo dos refatoramentos desta série de correções, posicionado
+**fora** do `async with self.client.transaction():` — ou seja, depois
+do lock já liberado. Conferido e confirmado: a intenção original desse
+sleep, desde o commit que o introduziu, sempre foi "pausa de
+acomodação... **antes de liberar a conexão** de volta pro polling
+rápido" — mas a posição atual não cumpria mais isso; só atrasava a
+atualização dos sensores de tensão em si, sem nenhum efeito sobre a
+central ou sobre quando o próximo status poderia ser enviado. O próprio
+comentário no código já admitia isso, sem que eu tivesse revisado se
+valia a pena manter mesmo assim.
+
+Corrigido movendo o `sleep(1.0)` para dentro do `async with`, logo após
+o fechamento da conexão — restaurando o comportamento original: o lock
+fica reservado durante a pausa inteira, então o scheduler de status não
+consegue abrir uma conexão nova nem enviar nada até o segundo completo
+ter passado desde o fechamento. Testado com um cenário reproduzindo a
+disputa real pelo lock (`asyncio.Lock()` de verdade, uma tarefa
+simulando a consulta de tensão e outra pedindo o lock durante a pausa)
+— confirmando que a segunda tarefa só consegue o lock exatamente após
+o segundo completo, não antes.
+
+### Adicionado — opção para desativar a consulta de tensão independente da senha do app remoto
+
+Pedido do usuário, motivado por uma lacuna real na correção anterior
+desta mesma versão ("senha removida não desativava mais a consulta de
+tensão" — ver abaixo): para modelos/firmwares antigos, a senha do app
+remoto (`CONF_LEGACY_EEPROM_PASSWORD`) é **obrigatória** só para obter
+nomes de zona/eventos (`supports_legacy_eeprom`) — removê-la para
+desligar a tensão quebraria essa outra funcionalidade também. Só
+modelos modernos (que já leem nomes/eventos via `0x5C`, sem precisar
+dessa senha) conseguiam desligar a tensão simplesmente removendo a
+senha.
+
+Nova opção `CONF_VOLTAGE_READING_ENABLED` (`voltage_reading_enabled`),
+independente da senha, exibida logo abaixo dela nas duas telas (config
+inicial e reconfiguração). `supports_voltage_reading` passa a exigir
+três condições em vez de duas: senha preenchida **e** família com
+offset confirmado **e** esta opção marcada. Lida ao vivo de
+`entry.data` a cada consulta (mesmo padrão da correção da senha, sem
+cache travado na criação).
+
+**Sem breaking change**: padrão `True` (marcado) — quem já tinha a
+senha preenchida antes desta opção existir continua recebendo tensão
+automaticamente, sem precisar entrar nas opções e marcar nada. Modelos
+antigos que querem manter nomes/eventos mas desligar só a tensão agora
+podem desmarcar esta opção nova, mantendo a senha preenchida. Avaliado
+e descartado deliberadamente um desenho com padrão desmarcado
+(breaking change de verdade, exigindo ação de todo mundo que já usa a
+funcionalidade) — o usuário concordou com a versão sem quebra depois
+de eu explicar o trade-off.
+
+Testado com a property `supports_voltage_reading` real, extraída do
+arquivo publicado via AST, em 4 cenários: senha preenchida + opção
+ausente do `entry.data` (upgrade de instalação antiga → `True`,
+confirma a ausência de breaking change), senha preenchida + opção
+desmarcada (→ `False`), senha vazia + opção marcada (→ `False`, senha
+continua sendo pré-requisito), e família sem offset confirmado (→
+`False`, inalterado). Traduções atualizadas nos quatro arquivos
+(`strings.json`, `pt-BR.json`, `pt.json`, `en.json`).
+
+### Corrigido — dessincronização de stream TCP após sessão 0xE7 (causa real de timeouts na consulta de status)
+
+Diagnóstico do próprio usuário, com log preciso: a consulta de status
+não estava de fato recebendo os 73 bytes esperados. O socket ficava
+dessincronizado — 4 bytes residuais de uma sessão `0xE7` anterior
+(ex.: `48 FF 91 AF`) precediam o frame de status real e correto. O
+leitor genérico pega o primeiro byte residual (`48`) e o interpreta
+como "Nº Bytes", esperando 73 bytes; recebe os 3 bytes residuais
+restantes + o frame de status inteiro de 57 bytes = 60 bytes — batendo
+exatamente com o padrão observado no log ("recebidos 60/73") — e fica
+esperando os 13 bytes que faltam, que nunca virão, até estourar o
+timeout. **Esse erro não era resolvido aumentando o timeout — a causa
+é enquadramento/dessincronização do stream, não tempo insuficiente.**
+
+Usuário comparou uma versão própria (testada e com diagnóstico
+correto) contra a nossa; após análise comparativa (ver conversa),
+foram adotados 3 itens dessa versão, mais uma correção adicional
+encontrada durante o trabalho:
+
+**1. Timeout total único, sem reiniciar entre etapas, preservando bytes
+parciais.** `drain()` não tinha timeout NENHUM antes (podia travar
+indefinidamente se o buffer de escrita TCP nunca esvaziasse); cabeçalho
+e corpo da resposta recebiam cada um um timeout novo — uma troca podia
+levar até ~3x o timeout configurado antes de finalmente falhar, apesar
+das próprias mensagens de erro já falarem em "tempo limite total".
+Corrigido com `_read_exactly_with_timeout()` (novo, em `panel_client.py`
+e `panel_client_amt8000.py`): um único `deadline` calculado uma vez,
+reaproveitado em drain + cabeçalho + corpo, preservando quantos bytes
+chegaram antes do timeout estourar (informação perdida antes). Testado
+com sockets reais (não mockados): leitura normal, timeout com parcial
+preservado (reproduzindo o cenário exato do relato — `48 FF 91 AF` —
+como teste automatizado) e confirmação de que o corpo não ganha um
+timeout novo e cheio depois do cabeçalho.
+
+**2. `disconnect_in_transaction()`** (novo, nos dois clientes): fecha o
+TCP com o lock já adquirido por `transaction()`, sem tentar readquiri-lo
+(evitaria deadlock). Infraestrutura de apoio ao item 3.
+
+**3. Fecha a conexão TCP após toda sessão `0xE7`, sucesso ou falha.**
+Decisão deliberada (não só nos caminhos de falha): qualquer saída de
+uma sessão `0xE7` — autenticação negada, checksum inválido, erro de
+protocolo, ou sucesso completo — força o próximo comando (status, PGM,
+etc.) a começar num stream TCP nunca usado, sem chance de arrastar
+sobra nenhuma. Aplicado em `_async_legacy_eeprom_session()` (leitura de
+nomes/eventos) e `async_refresh_voltage()` (consulta de tensão a cada 5
+minutos), via `try`/`finally` + novo
+`coordinator._async_close_legacy_eeprom_connection()`. Custo aceito:
+reconectar após cada leitura de tensão (a cada 5 minutos) ou sincronização
+de nomes — não a cada ciclo rápido de status. A pausa de acomodação de 1s
+já existente na consulta de tensão foi mantida como margem de segurança
+adicional, reposicionada para depois do fechamento da conexão (não
+afeta mais o próximo comando, que já reconecta do zero de qualquer
+forma).
+
+**Não adotado da versão comparada**: um comando de logout explícito
+0xE7 (`montar_comando_logout` + leitura de resposta fixa) estava
+implementado ali, mas sem uso em nenhum lugar — a própria versão testada
+optou pela abordagem mais simples (fechar o TCP direto) em vez dessa,
+conforme documentado no código-fonte comparado. Não incluído por não
+ter sido de fato exercitado.
+
+### Corrigido — consulta de tensão continuava rodando após remover a senha do app remoto na reconfiguração
+
+Bug real relatado pelo usuário. A causa exata do mecanismo de
+recarregamento que permitia isso não foi isolada com certeza total — a
+sequência de unload/reload do próprio Home Assistant, conferida direto
+no código-fonte, parece correta, e a checagem de elegibilidade
+(`supports_voltage_reading`) já existia tanto no registro do timer
+quanto dentro da própria função. Mesmo assim, `self._legacy_eeprom_password`
+era lido de `entry.data` **uma única vez**, em `__init__`, e guardado
+num atributo simples — se por qualquer motivo uma instância antiga do
+coordinator sobrevivesse à reconfiguração, ela nunca saberia da
+remoção da senha.
+
+Corrigido tornando `_legacy_eeprom_password` uma `@property` que lê
+`self.entry.data` a cada consulta, em vez de um valor travado no
+momento da criação — `entry` é o mesmo objeto mutado no lugar por
+`async_update_entry()` (confirmado direto no código-fonte do Home
+Assistant) independentemente de qual instância do coordinator o mantém
+referenciado, então mesmo numa instância antiga isso passa a refletir a
+mudança imediatamente. Cobre de graça tanto `supports_legacy_eeprom`
+quanto `supports_voltage_reading` (ambos dependem deste valor) e a
+montagem do frame de autenticação em si. Testado com a property real
+extraída do arquivo publicado via AST, mutando `entry.data` na mesma
+instância de coordinator sem recriá-la — confirmando que a mudança é
+refletida na hora.
+
 ## [2.1.0-beta]
+
+### Corrigido — botões de ação não refletiam disponibilidade (nem para indisponível, nem de volta)
+
+Bug real relatado pelo usuário: religar a conexão após reiniciar o
+Home Assistant com ela desligada não fazia os botões de ação (pânico,
+anular zonas, sincronizar nomes) voltarem a ficar disponíveis — e,
+investigando mais a fundo, desligar a conexão com o Home Assistant já
+rodando também nunca os deixava indisponíveis, apesar da propriedade
+`available` sempre ter calculado o valor certo (`coordinator.
+last_update_success`).
+
+Causa: `_IntelbrasButtonBase` não herda de `CoordinatorEntity` (decisão
+deliberada — esses botões não exibem nenhum dado do coordinator, só
+agem), mas por isso também não ganha de graça o mecanismo que
+`CoordinatorEntity` usa para reagir a mudanças — `BaseCoordinatorEntity.
+async_added_to_hass()`, no próprio `update_coordinator.py` do Home
+Assistant, registra um listener via `coordinator.async_add_listener()`
+que chama `async_write_ha_state()` sempre que o coordinator notifica.
+Sem herdar essa classe, `available` até calculava certo quando
+consultado, mas nada disparava uma nova escrita de estado quando
+`last_update_success` mudava — o botão ficava com o valor antigo
+travado até a próxima reescrita por qualquer outro motivo (raramente
+acontecendo, já que esses botões não têm outro estado que mude).
+
+Corrigido replicando manualmente só a parte necessária desse mecanismo
+em `_IntelbrasButtonBase.async_added_to_hass()`
+(`coordinator.async_add_listener(self.async_write_ha_state)`, via
+`self.async_on_remove()` para desinscrever corretamente) — sem herdar
+`CoordinatorEntity` por inteiro, mesmo motivo de antes. Confirmado
+seguro mesmo com `update_interval=None` do coordinator (scheduler
+próprio desta versão): `async_add_listener()` chama
+`_schedule_refresh()`, que já retorna imediatamente sem fazer nada
+quando `update_interval` é `None` — verificado direto no código-fonte
+do Home Assistant instalado, não reabre a porta para o bug de
+agendamento sub-segundo corrigido anteriormente nesta mesma série.
+
+Testado com a classe real extraída do arquivo publicado (mesma técnica
+das correções anteriores desta série), com um coordinator simulado
+reproduzindo `async_add_listener`/`async_update_listeners` do
+`DataUpdateCoordinator` de verdade — confirmando que o botão empurra um
+novo estado exatamente quando a disponibilidade muda, nas duas
+direções (ficar indisponível ao desligar, voltar a ficar disponível ao
+religar).
+
+### Corrigido — inicialização lenta, prioridade de comando removida sem intenção e entidades não ficando indisponíveis
+
+Três problemas relatados pelo usuário após a versão anterior (scheduler
+próprio de polling) entrar em uso real:
+
+**1. Inicialização do Home Assistant demorando exageradamente.** Causa
+confirmada direto no código-fonte do Home Assistant instalado
+(`homeassistant/core.py`): `resume_polling()` criava a task do
+scheduler com `hass.async_create_task()`, que registra a task em
+`hass._tasks` — um conjunto que `hass.async_block_till_done()` espera
+terminar. Como `_polling_loop()` roda indefinidamente enquanto a
+conexão estiver ligada, qualquer chamada a `async_block_till_done()`
+durante ou logo após a inicialização ficava esperando uma task que
+nunca termina sozinha. Corrigido usando
+`entry.async_create_background_task()` — documentado no próprio HA
+como "Will not block startup" e "Calls to async_block_till_done will
+not wait for completion", além de cancelar a task automaticamente no
+unload da config entry.
+
+**2. Dois commits (`ec86ea9`, `ba9516f`) tentaram corrigir o item 1**
+com uma versão testada pelo usuário — o diagnóstico da API de task
+estava certo, mas o segundo commit removeu por completo, sem indicação
+disso na mensagem (aparentemente por ter partido de uma versão mais
+antiga do arquivo como base), o mecanismo de prioridade de comando
+sobre o scheduler de status (`_pode_iniciar_status`, adicionado numa
+versão anterior desta mesma série de correções). Restaurado nesta
+versão, junto com a correção real do item 1.
+
+**3. Entidades não ficavam indisponíveis com o switch de conexão
+desligado.** `CoordinatorEntity.available` é `coordinator.
+last_update_success`, que só é marcado `False` quando uma tentativa de
+refresh *falha*. Como `pause_polling()` agora impede qualquer nova
+tentativa de sequer acontecer (em vez de deixar uma falhar, como no
+scheduler antigo do `DataUpdateCoordinator`), esse valor nunca mudava
+— ficava travado em `True` (do último sucesso) indefinidamente, com
+todas as entidades baseadas no coordinator (painel, sensores, PGMs)
+continuando a aparecer disponíveis, com dados cada vez mais
+desatualizados. Corrigido chamando `coordinator.async_set_update_error()`
+dentro de `pause_polling()` — método público do próprio
+`DataUpdateCoordinator` para marcar a falha manualmente e notificar as
+entidades na hora, sem precisar de um ciclo de refresh de verdade para
+chegar lá. Ao religar, `async_request_status_refresh()` (já chamado
+pelo switch) aciona um ciclo real, restaurando a disponibilidade
+normalmente em caso de sucesso.
+
+Os itens 1 e 3 testados com as funções reais extraídas do arquivo
+publicado (mesma técnica das correções anteriores desta série): o
+item 1 com o mock de `entry.async_create_background_task`, o item 3
+confirmando que `last_update_success` transiciona para `False` e
+notifica as entidades exatamente uma vez ao desligar a conexão, sem
+notificação duplicada em chamadas repetidas.
+
+### Adicionado — scheduler próprio para o polling de status (substitui `update_interval` do `DataUpdateCoordinator`)
+
+Investigação aprofundada, com log real em produção e análise cruzada
+de arquitetura (usuário consultou uma segunda IA, e depois compartilhou
+uma versão própria da integração já parcialmente reescrita — comparada,
+validada e usada como base desta mudança): o `DataUpdateCoordinator`
+do próprio Home Assistant **não é preciso o suficiente para cadência
+sub-segundo**. Confirmado em três camadas independentes:
+
+1. **Código-fonte do HA** (lido diretamente, não só a documentação):
+   `_schedule_refresh()` calcula `next_refresh = int(loop.time()) +
+   self._microsecond + update_interval` — o `int(loop.time())` trunca
+   a parte fracionária do relógio monotônico; com `update_interval`
+   sub-segundo (0,25s), o horário calculado pode cair no passado,
+   fazendo `loop.call_at()` disparar quase imediatamente. Há inclusive
+   um comentário explícito no código do HA: *"DataUpdateCoordinator
+   does not need an exact update interval"*.
+2. **Simulação isolada**, com `time.monotonic()` real: reproduziu
+   exatamente o padrão relatado — rajadas de consultas a cada ~83ms,
+   seguidas de uma pausa de várias centenas de ms, repetindo a cada
+   segundo.
+3. **Log real** anexado pelo usuário, analisado de forma independente
+   (não só conferindo os números já calculados): 249 consultas de
+   status em 39,7s, mediana de 84ms entre envios, até 8 consultas no
+   mesmo segundo civil — bateu exatamente com o relatado.
+
+**Correção**: `update_interval=None` no `DataUpdateCoordinator` (que
+continua sendo usado para armazenar/comparar `PanelStatus`,
+`always_update=False`, notificar entidades e controlar
+disponibilidade — nada disso muda) e um scheduler próprio
+(`coordinator._polling_loop()`), com:
+
+- **Marca o início real de cada consulta no momento exato do envio**
+  (`on_sent`, callback passado a `PanelClient.send_command()`,
+  disparado dentro do lock, imediatamente antes de `writer.write()`)
+  — não no momento em que o ciclo é decidido, que pode ficar bem antes
+  se algo estiver segurando o lock.
+- **Nunca tenta "recuperar" consultas atrasadas**: se uma demorar (ex.:
+  bloqueada por um comando), a próxima só é permitida a partir do
+  intervalo configurado contado do início real da anterior — nunca
+  dispara em sequência para compensar o atraso.
+- **Fallback para falhas antes do envio** (`_last_status_cycle_started_
+  monotonic`): se a consulta falhar antes de conseguir escrever no
+  socket (`on_sent` nunca dispara), o scheduler ainda respeita um
+  intervalo mínimo entre tentativas, evitando um loop apertado nesse
+  cenário específico.
+- **Coalescimento de pedidos concorrentes**: os pontos que hoje pedem
+  um status extra após um comando (PGM/armar/desarmar/anular — eram 13
+  chamadas a `async_request_refresh()`) passam a usar
+  `async_request_status_refresh()`, que aguarda o próximo ciclo do
+  scheduler via `Future` — vários pedidos simultâneos compartilham a
+  mesma consulta, em vez de gerar uma para cada.
+- **Prioridade de comando sobre o scheduler de status** (pedido
+  explícito do usuário, adicionado por cima da base compartilhada):
+  novo evento `_pode_iniciar_status`, limpo por
+  `_send_and_check`/`_send_and_check_amt8000` (os dois únicos pontos
+  que enviam comandos de usuário) antes de enviar e restaurado depois
+  — o scheduler verifica essa flag antes de *iniciar* qualquer consulta
+  nova. Não interrompe uma consulta já em voo no momento em que o
+  comando chega (isso já é garantido pelo lock da conexão, sem precisar
+  de nada especial) — só impede que o scheduler dispare *outra* antes
+  do comando terminar.
+- Ciclo de vida limpo: `resume_polling()`/`async_stop_polling()`
+  criam/cancelam a task própria corretamente (mesma disciplina já
+  aplicada no bug do Receptor IP — sem task órfã após reload).
+
+Testado com as funções **reais**, extraídas diretamente do arquivo
+publicado (via AST, não uma reimplementação à parte), incluindo um
+`asyncio.Lock()` de verdade compartilhado entre uma consulta de status
+simulada e um comando simulado — confirmando a sequência completa:
+cadência estável (~250ms, sem rajada), nenhuma consulta nova durante a
+janela de prioridade de um comando, e o comando esperando corretamente
+uma consulta já em andamento terminar antes de agir.
+
+### Adicionado — filtro na resposta bruta, antes de interpretar (complementar ao `always_update=False`)
+
+Segunda camada de filtro, pedida explicitamente pelo usuário depois de
+esclarecer onde o filtro anterior (`always_update=False`, ver seção
+abaixo) realmente acontece: **inteiramente dentro do Home Assistant**,
+depois da resposta já ter sido recebida E interpretada num
+`PanelStatus` — nunca ao receber da central. A pergunta que motivou
+esta mudança: dava pra filtrar antes, comparando os bytes brutos da
+resposta, evitando até o trabalho de interpretar quando nada mudou?
+
+Novo método `coordinator._resposta_bruta_mudou()`: compara os bytes
+crus da resposta atual contra os da última resposta válida recebida —
+`0x5A`/`0x5B` (famílias 2018/4010) e `0x0B4A` (AMT 8000). Se forem
+idênticos, reaproveita o `PanelStatus` já existente em vez de
+reinterpretar do zero; se diferentes (ou na primeira leitura, sem nada
+em cache ainda), interpreta normalmente. Aplicado nos dois pontos de
+entrada existentes (`_async_update_data` e `_async_update_data_amt8000`).
+
+**Cuidado que o usuário pediu explicitamente para não esquecer**: a
+AMT 8000 é a única família cuja resposta bruta inclui o segundo do
+relógio (as demais só têm minuto) — comparar bytes crus sem tratar
+isso especificamente reintroduziria, agora no nível de bytes, o
+EXATO MESMO problema já corrigido no nível de campos interpretados
+(ver seção anterior sobre a correção de segundo/minuto): até 60
+"mudanças" falsas por minuto, só por causa do segundo mudando. Nova
+função `protocol_amt8000.normalizar_status_para_comparacao()` zera o
+byte do segundo (offset 70) antes de comparar — só usado para decidir
+se vale a pena reinterpretar; o que fica guardado em cache continua
+sendo os bytes verdadeiros, não os normalizados.
+
+Testado: extraído o método `_resposta_bruta_mudou()` diretamente do
+arquivo publicado (via AST, não uma reimplementação à parte) e
+executado contra 5 cenários — primeira leitura, bytes idênticos, bytes
+diferentes, AMT 8000 com só o segundo mudando (deve ignorar) e AMT
+8000 com outro byte mudando (deve detectar) — todos corretos.
+
+### Corrigido — AMT 8000 gerava até 60 atualizações/minuto por causa do segundo no relógio
+
+Revisão adicional da melhoria de `always_update=False` (ver seção
+acima) — discussão com o usuário esclareceu um ponto importante: a
+data/hora da central **deve** continuar fazendo parte normal da
+comparação de igualdade (não deve ser excluída) — é um dado real
+reportado pela central, então uma mudança de minuto genuinamente
+reflete uma resposta diferente, mesmo sem nenhum sensor mudando. As
+famílias 2018/4010 já são naturalmente de precisão só de minuto (ver
+`protocol._format_panel_datetime`), então isso já resultava numa
+cadência baixa (no máximo 1x/minuto) e correta.
+
+A **AMT 8000** era a exceção real: sua resposta de status inclui
+precisão de **segundo**, e uma decisão anterior deste projeto (antes
+de existir `always_update=False`, quando isso ainda não fazia
+diferença prática) optou por ler essa precisão total, revertendo uma
+escolha original do fluxo de referência que zerava/ignorava o segundo
+por esse mesmo motivo. Sem corrigir isso, `panel_datetime_str` mudaria
+a cada segundo, gerando até 60 notificações desnecessárias por minuto
+mesmo sem nenhuma mudança real — justamente o problema que
+`always_update=False` deveria evitar.
+
+Corrigido em `protocol_amt8000.py`: o segundo continua sendo lido e
+validado (garante que os 6 bytes de data/hora são consistentes), mas o
+texto final (`panel_datetime_str`) agora usa o mesmo formato de
+precisão de minuto das demais famílias ("dd/mm/aaaa hh:mm", sem
+segundo) — restaurando o comportamento original do fluxo de
+referência, agora pela razão certa. Testado de ponta a ponta contra
+`parse_status()` real: segundos diferentes dentro do mesmo minuto
+produzem o mesmo `PanelStatus` (`==` verdadeiro); uma mudança de
+minuto de verdade continua sendo detectada normalmente.
+
+### Melhoria — evita reescritas de estado desnecessárias (`always_update=False`)
+
+Achado numa revisão pontual, cruzando com o blog oficial da Home
+Assistant ("Avoid unnecessary callbacks with DataUpdateCoordinator",
+2023-07-27): o comportamento **padrão** do `DataUpdateCoordinator` é
+notificar/reescrever o estado de todas as entidades a cada ciclo,
+**mesmo quando o dado não mudou** — a otimização (`always_update=False`)
+existe, mas precisa ser configurada explicitamente, o que esta
+integração não fazia.
+
+Especialmente relevante para esta integração: polling a cada 0,25s
+(4x/segundo) — bem mais frequente que o caso típico do artigo — então
+a central provavelmente reporta o mesmo status na grande maioria dos
+ciclos (casa parada). Requer que a classe de dados suporte comparação
+de igualdade por valor — `protocol.PanelStatus` já tem isso "de graça"
+por ser uma `@dataclass` simples (testado isoladamente antes de
+aplicar: duas instâncias com os mesmos valores comparam como iguais,
+com um campo diferente comparam como diferentes). Confirmado também
+lendo o código-fonte do próprio `DataUpdateCoordinator` instalado: com
+`always_update=False`, a notificação só acontece quando o sucesso da
+consulta muda de estado *ou* os dados realmente mudam.
+
+Ressalva conhecida e documentada no código: `coordinator.last_status_raw`
+(bytes brutos da última resposta, exposto como atributo de diagnóstico
+em "Último comando") vive fora do `PanelStatus` e é atualizado a cada
+ciclo — num cenário bem incomum (algum byte não capturado por nenhum
+campo interpretado mudando sozinho), esse atributo específico poderia
+ficar parado até a próxima mudança real. Atributo puramente de
+diagnóstico, sem efeito em nenhuma lógica de automação.
+
+### Adicionado — entidades de partições armadas ausente/presente
+
+Duas entidades novas (`sensor`): **"Partições armadas ausente"** e
+**"Partições armadas presente"** — contagem no estado, lista de quais
+partições nos atributos. Resumo rápido sem precisar checar cada
+`alarm_control_panel` de partição individualmente. Usa
+`status.partitions_armed` (o que a central reporta de verdade) como
+fonte da existência/estado "ativada" — não só o que esta integração
+rastreou internamente (`coordinator.armed_home_mode`), garantindo que
+partições ativadas por fora dela (teclado físico, outro app) também
+apareçam corretamente. Partições com disparo em andamento não entram
+em nenhuma das duas contagens, mesmo critério já usado no estado de
+cada `alarm_control_panel`. Testado isoladamente com 4 cenários
+(ausente, presente, não rastreada, disparada).
+
+### Adicionado — recomendação sobre o evento 1410 do app AMT Remoto
+
+Documentação (tela de configuração + README) atualizada: quem preenche
+a senha de leitura de 6 dígitos agora é avisado para considerar
+desativar o envio do evento `1410` ("Acesso remoto para leitura de
+eventos ou configurações") no app AMT Remoto — esta integração
+autentica com essa senha periodicamente (a cada 5 minutos, para a
+tensão), e cada autenticação gera esse evento na central, podendo
+encher o histórico de eventos ao longo do tempo. Aproveitado também
+para corrigir uma descrição desatualizada no README sobre quando essa
+senha é necessária (não mencionava mais a tensão como um dos motivos).
+
+### Corrigido — timeouts de status coincidindo com o ciclo de tensão (causa raiz real)
+
+Investigação aprofundada (log real + análise cruzada de arquitetura,
+com apoio de outra IA consultada pelo usuário) sobre os timeouts
+esporádicos na consulta de status já relatados numa versão anterior
+desta release — a mitigação anterior (pausa de acomodação de 1s
+depois da consulta de tensão) não resolveu de fato, como confirmado
+por um novo log em produção: os timeouts continuavam acontecendo,
+sempre no **mesmo instante exato** dentro de cada ciclo de 5 minutos
+da consulta de tensão (não distribuídos aleatoriamente).
+
+Causa raiz confirmada no código: a sequência de autenticação + consulta
+(protocolo `0xE7`, usado tanto na tensão quanto na leitura legada de
+nomes/eventos) enviava cada comando via `send_command()` normal — que
+adquire e libera o lock de comunicação **a cada chamada individual**.
+Isso deixava uma janela real, durante o `asyncio.sleep()` entre a
+autenticação e o comando seguinte, em que o polling rápido de status
+(a cada 0,25s) podia se intercalar **no meio** da troca autenticada —
+provavelmente confundindo o estado de sessão da central e causando
+lentidão na resposta ao comando seguinte, seja da própria transação ou
+do polling.
+
+- `panel_client.PanelClient`: novo mecanismo de transação atômica —
+  `transaction()` (context manager que mantém o lock adquirido por
+  toda a duração de um bloco `async with`) e
+  `send_command_in_transaction()` (mesma lógica de `send_command()`,
+  mas sem adquirir o lock sozinho — só utilizável dentro de
+  `transaction()`). `send_command()` continua funcionando exatamente
+  como antes para uso avulso.
+- `coordinator.async_refresh_voltage()` e
+  `coordinator._async_legacy_eeprom_session()` (usada tanto na
+  sincronização de nomes quanto na leitura de eventos) — reescritas
+  para rodar a sequência inteira (autenticação + comando(s) seguintes)
+  dentro de uma única transação, sem soltar o lock no meio.
+- Testado isoladamente: confirmado que nenhum status consegue adquirir
+  o lock durante uma transação em andamento (mesmo com múltiplas
+  tentativas concorrentes simuladas), e que uma exceção levantada no
+  meio de uma transação ainda libera o lock corretamente (sem travar a
+  conexão).
+- Instrumentação de log adicionada (nível debug) nos três caminhos —
+  consulta de status normal, consulta de tensão, sessão legada — com
+  timestamps de alta resolução em cada etapa, para permitir confirmar
+  em produção (com o log em nível debug ativado) se a correção resolveu
+  de fato, e facilitar diagnósticos parecidos no futuro.
 
 ### Corrigido — nomes de zona/usuário voltavam ao genérico após reinício
 

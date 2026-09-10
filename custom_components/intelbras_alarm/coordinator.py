@@ -4,7 +4,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from datetime import datetime, timedelta
+from collections.abc import Callable
+from datetime import datetime
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -26,8 +27,10 @@ from .const import (
     CMD_EEPROM_READ,
     CONF_ENABLED_ZONES,
     CONF_LEGACY_EEPROM_PASSWORD,
+    CONF_VOLTAGE_READING_ENABLED,
     DEFAULT_CONNECTION_HEALTH_TIMEOUT,
     DEFAULT_ENABLED_ZONES_SPEC,
+    DEFAULT_POLLING_INTERVAL,
     DEFAULT_REQUEST_TIMEOUT,
     EEPROM_EXTENDED_MIN_FIRMWARE,
     EVENT_ENTITY_RECENT_COUNT,
@@ -49,6 +52,7 @@ from .const import (
     MODEL_STATUS_MIN_LEN_OVERRIDE,
     MODEL_TABLE,
     MODEL_UNKNOWN,
+    OPT_POLLING_INTERVAL,
     PGM_ADDRESSES,
     USER_NAME_RECORD_LEN,
     USER_NAME_TABLE_CAPACITY,
@@ -140,13 +144,6 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
         self._partition_passwords = partition_passwords or {}
         self.family = family
         self.model_key = model_key
-        # Senha opcional de leitura de mensagens (0xE7 + identificação),
-        # ver protocol_legacy_eeprom.py e supports_legacy_eeprom abaixo.
-        # Em branco por padrão -- só habilita a funcionalidade se o
-        # usuário preencher explicitamente na configuração.
-        self._legacy_eeprom_password: str | None = entry.data.get(
-            CONF_LEGACY_EEPROM_PASSWORD
-        ) or None
         self.zone_names: dict[int, str] = {}
         # Nomes de usuário, lidos junto com os de zona (mesma chamada,
         # mesma condição de disponibilidade — ver async_refresh_zone_names).
@@ -194,6 +191,16 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
         # no polling — sugestão do usuário: dá pra ver a sequência inteira
         # sem precisar de log, como atributo do sensor "Último comando".
         self.last_status_raw: str | None = None
+        # Cache dos bytes brutos (não hex — bytes mesmo) da última
+        # resposta de status válida, usado para filtrar ANTES de
+        # interpretar (ver _resposta_bruta_mudou()) — pedido explícito do
+        # usuário: comparar a resposta bruta, não só o resultado já
+        # interpretado (que já era comparado via always_update=False, ver
+        # __init__ acima). Guarda os bytes VERDADEIROS (não normalizados)
+        # mesmo para a AMT 8000 — a normalização (zerar o byte de
+        # segundo) é aplicada só na hora de comparar, não no que fica
+        # guardado aqui.
+        self._last_raw_status_content: bytes | None = None
         # Os três campos abaixo só são atualizados por comandos REAIS
         # (armar, desarmar, PGM, sirene, pânico, bypass) — nunca pela
         # consulta de status, que roda a cada ciclo de polling (0,25s por
@@ -248,57 +255,289 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
             )
             self._enabled_zones = parse_zone_spec(DEFAULT_ENABLED_ZONES_SPEC)
 
+        # O intervalo continua sendo configurável exatamente pela mesma
+        # opção existente (``polling_interval``). Ele NÃO é mais entregue ao
+        # timer interno do DataUpdateCoordinator: o scheduler do HA não é
+        # apropriado para cadência sub-segundo e, com 0,25s, foi observado em
+        # log disparando rajadas de 6-8 consultas/s. O valor abaixo é usado
+        # pelo scheduler próprio implementado nesta classe.
+        # O piso por familia entra aqui, e nao no valor configurado: a ANM 24
+        # Net G2 atende uma sessao local por vez e trava se for consultada na
+        # cadencia sub-segundo que as outras familias suportam. Aplicar o piso
+        # neste ponto cobre o scheduler proprio desta classe, que e quem agenda
+        # as consultas.
+        self._configured_polling_interval = _polling_interval_for(
+            family,
+            float(entry.options.get(OPT_POLLING_INTERVAL, DEFAULT_POLLING_INTERVAL)),
+        )
+
         super().__init__(
             hass,
             _LOGGER,
             name=f"Intelbras Alarm ({entry.title})",
-            update_interval=timedelta(
-                seconds=_polling_interval_for(family, entry.options.get("polling_interval", 0.25))
-            ),
+            update_interval=None,
+            # Evita notificar/reescrever o estado de todas as entidades a
+            # cada ciclo quando nada mudou de verdade — comportamento
+            # padrão do DataUpdateCoordinator é sempre notificar, mesmo
+            # sem mudança (ver blog oficial da Home Assistant, "Avoid
+            # unnecessary callbacks with DataUpdateCoordinator", 2023-07-27).
+            # Especialmente relevante aqui: polling a cada 0,25s (4x/s) —
+            # bem mais frequente que o caso típico do artigo — então a
+            # central provavelmente reporta o MESMO status na grande
+            # maioria dos ciclos (casa parada). Requer que PanelStatus
+            # tenha __eq__ funcionando corretamente por comparação de
+            # valor — já tem, de graça, por ser uma @dataclass simples
+            # (testado isoladamente antes de aplicar esta mudança).
+            #
+            # ⚠️ Ressalva conhecida: `last_status_raw` (bytes brutos da
+            # última resposta, exposto como atributo de diagnóstico em
+            # sensor.py) vive FORA do PanelStatus e é atualizado a cada
+            # ciclo — se algum byte não capturado por nenhum campo que
+            # interpretamos mudar sem nenhum campo PARSEADO mudar junto
+            # (bem incomum), esse atributo específico pode ficar parado
+            # até a próxima mudança real. Atributo puramente de
+            # diagnóstico, sem efeito em nenhuma lógica de automação.
+            always_update=False,
         )
-        # Guardado à parte pra poder restaurar depois de pause_polling()
-        # (ver logo abaixo) — self.update_interval pode ser zerado
-        # temporariamente, então precisamos lembrar o valor de verdade.
-        self._configured_polling_interval = self.update_interval
+        # Scheduler próprio do polling rápido. O DataUpdateCoordinator
+        # continua sendo usado para armazenar/comparar ``PanelStatus`` e
+        # notificar as entidades, mas NÃO agenda mais o polling.
+        self._polling_enabled = False
+        self._polling_task: asyncio.Task[None] | None = None
+        self._polling_wakeup = asyncio.Event()
+        self._status_refresh_waiters: set[asyncio.Future[None]] = set()
+        # Instante monotônico em que o último ciclo foi iniciado. Serve de
+        # fallback para limitar retries quando a conexão falha antes de o
+        # frame chegar a ser escrito no socket.
+        self._last_status_cycle_started_monotonic: float | None = None
+        # Instante EXATO em que o último frame de status foi escrito no
+        # socket. É atualizado por callback dentro do PanelClient, depois de
+        # adquirir o lock e imediatamente antes de ``writer.write()``. É
+        # essa marca que garante no máximo 1 STATUS por intervalo configurado,
+        # mesmo quando o status ficou algum tempo esperando atrás de PGM,
+        # tensão ou outra operação no lock global da conexão.
+        self._last_status_sent_monotonic: float | None = None
+        # Prioridade de comando sobre o scheduler de status — pedido
+        # explícito do usuário, complementar ao mecanismo acima. O lock
+        # sozinho (FIFO) não garante que um comando "fure a fila" à
+        # frente de uma consulta de status que esteja prestes a começar
+        # (só garante que ele espera o que já está EM VOO no exato
+        # momento em que chega) — sem isso, um comando podia
+        # ocasionalmente ficar atrás não só da consulta ativa, mas
+        # também de uma nova que o scheduler disparasse por coincidência
+        # de tempo. `_send_and_check`/`_send_and_check_amt8000` (os dois
+        # únicos pontos que enviam comandos de usuário — PGM, sirene,
+        # pânico, anular zona, armar, desarmar) limpam esta flag antes
+        # de enviar e a restauram depois; `_polling_loop()` verifica
+        # antes de iniciar cada nova consulta de status. Começa
+        # "liberada" (nenhum comando em andamento).
+        #
+        # Removida sem intenção aparente num commit posterior (ba9516f,
+        # baseado numa versão mais antiga do arquivo) e restaurada aqui.
+        self._pode_iniciar_status = asyncio.Event()
+        self._pode_iniciar_status.set()
+
+    def _mark_status_sent(self) -> None:
+        """Callback do PanelClient no instante real de envio de um STATUS."""
+        self._last_status_sent_monotonic = time.monotonic()
+
+    def _seconds_until_next_status(self) -> float:
+        """Tempo restante até ser permitido iniciar outro envio de STATUS."""
+        reference = self._last_status_sent_monotonic
+        if (
+            self._last_status_cycle_started_monotonic is not None
+            and (
+                reference is None
+                or self._last_status_cycle_started_monotonic > reference
+            )
+        ):
+            # Se o ciclo falhou antes de conseguir escrever no socket,
+            # limita a frequência de retries usando o início da tentativa.
+            reference = self._last_status_cycle_started_monotonic
+
+        if reference is None:
+            return 0.0
+        elapsed = time.monotonic() - reference
+        return max(0.0, self._configured_polling_interval - elapsed)
+
+    def _complete_status_refresh_waiters(self) -> None:
+        """Libera todos os comandos que aguardavam o próximo STATUS.
+
+        Vários comandos disparados juntos compartilham o mesmo próximo
+        refresh: não criamos um STATUS extra para cada PGM/arm/disarm.
+        """
+        waiters = tuple(self._status_refresh_waiters)
+        self._status_refresh_waiters.clear()
+        for waiter in waiters:
+            if not waiter.done():
+                waiter.set_result(None)
+
+    async def _polling_loop(self) -> None:
+        """Scheduler próprio do status, com cadência sub-segundo precisa.
+
+        Não tenta "recuperar" polls atrasados. Se um STATUS deveria sair às
+        10.250 mas ficou bloqueado por um PGM até 10.700, ele sai às 10.700
+        e o próximo só poderá sair a partir de 10.950.
+        """
+        try:
+            while self._polling_enabled:
+                if not self._pode_iniciar_status.is_set():
+                    # Um comando está em andamento (PGM/arme/desarme/etc.)
+                    # — prioridade dele sobre o scheduler de status, pedido
+                    # explícito do usuário. Nem calcula o próximo horário
+                    # permitido enquanto isso não for liberado de novo.
+                    await self._pode_iniciar_status.wait()
+                    continue
+
+                delay = self._seconds_until_next_status()
+                if delay > 0:
+                    self._polling_wakeup.clear()
+                    try:
+                        await asyncio.wait_for(
+                            self._polling_wakeup.wait(), timeout=delay
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+
+                    if not self._polling_enabled:
+                        break
+                    # Um comando pode acordar o scheduler antes da hora.
+                    # Acordar não permite furar o intervalo mínimo.
+                    if self._seconds_until_next_status() > 0:
+                        continue
+                    if not self._pode_iniciar_status.is_set():
+                        # Um comando começou durante a espera — revalida
+                        # do zero, mesma prioridade do topo do loop.
+                        continue
+
+                self._last_status_cycle_started_monotonic = time.monotonic()
+                try:
+                    # async_refresh() executa _async_update_data(), atualiza
+                    # self.data e aplica always_update=False, mas com
+                    # update_interval=None não agenda nenhum próximo ciclo.
+                    await self.async_refresh()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    # DataUpdateCoordinator normalmente trata UpdateFailed
+                    # internamente. Isto protege apenas contra uma exceção
+                    # realmente inesperada sem matar o scheduler definitivo.
+                    _LOGGER.exception(
+                        "Erro inesperado no scheduler próprio de consulta de status"
+                    )
+                finally:
+                    # Quem pediu refresh após um comando espera apenas que o
+                    # próximo ciclo termine, com sucesso ou falha — mesmo
+                    # comportamento prático do async_request_refresh anterior.
+                    self._complete_status_refresh_waiters()
+        finally:
+            if asyncio.current_task() is self._polling_task:
+                self._polling_task = None
 
     def pause_polling(self) -> None:
-        """Interrompe por completo o agendamento automático de consultas.
+        """Pausa o scheduler próprio sem criar novas consultas de status.
 
-        BUG REAL corrigido (relatado em produção, agosto/2026): antes desta
-        correção, desligar o switch "Conexão com a central" só fazia cada
-        *tentativa* de consulta falhar rápido (``UpdateFailed``, sem tentar
-        se comunicar de verdade) — mas o **agendador** do próprio
-        `DataUpdateCoordinator` (Home Assistant core) continuava se
-        reagendando sozinho, chamando `_async_update_data()` de novo e de
-        novo. Como cada tentativa desabilitada termina em ~0,000s, isso
-        criava um laço apertadíssimo (chegou a **milhares de chamadas por
-        segundo**, confirmado em log real), consumindo CPU à toa mesmo sem
-        nenhuma tentativa de comunicação de rede — só o próprio custo de
-        Python de levantar a exceção, formatar o log de debug do HA core
-        ("Finished fetching... success: False", gerado pelo próprio
-        `update_coordinator.py`, não por nós) e reagendar, repetidamente.
+        Nota (caso de borda, aceitável): se o loop estiver, no exato
+        momento desta chamada, esperando um comando terminar (prioridade
+        de comando, ver ``_pode_iniciar_status``), a pausa só é notada
+        depois que esse comando concluir — atraso pequeno e limitado à
+        duração de um único comando (tipicamente <100ms), não um loop
+        preso. ``async_stop_polling()`` (usado em unload/reload) não tem
+        essa limitação — usa ``task.cancel()``, que interrompe
+        imediatamente qualquer ponto de espera, independente do que o
+        loop estiver aguardando.
 
-        A correção: `update_interval = None` faz o agendador do HA core
-        (`_schedule_refresh()`) simplesmente **não agendar mais nada**
-        (`if self._update_interval_seconds is None: return`) — não é
-        "tentar rápido e falhar", é "não tentar mais até alguém pedir".
-        Chamado tanto ao desligar o switch manualmente (`switch.py`) quanto
-        na inicialização, se a integração já subir com o switch desligado
-        (`__init__.py`) — nesse segundo caso, sem isso, o primeiro listener
-        adicionado (`async_add_listener`, quando as entidades são criadas)
-        já dispararia um agendamento normal antes de qualquer consulta
-        sequer ter rodado uma vez.
+        Bug real corrigido: como parar o scheduler significa que nenhuma
+        consulta nova será sequer TENTADA, o mecanismo natural do
+        ``DataUpdateCoordinator`` que marca ``last_update_success=False``
+        (que só acontece quando uma tentativa de refresh FALHA) nunca era
+        acionado — o valor ficava travado em ``True`` (do último sucesso)
+        indefinidamente, e ``CoordinatorEntity.available`` é exatamente
+        ``coordinator.last_update_success``. Resultado: todas as entidades
+        baseadas no coordinator (painel, sensores, PGMs) continuavam
+        aparecendo como disponíveis, com dados cada vez mais desatualizados,
+        mesmo com o switch de conexão desligado. ``async_set_update_error()``
+        é a forma pública e correta do próprio ``DataUpdateCoordinator``
+        para marcar isso manualmente e notificar as entidades na hora, sem
+        precisar de um ciclo de refresh de verdade para chegar lá.
         """
-        self.update_interval = None
+        self._polling_enabled = False
+        self._polling_wakeup.set()
+        # Não deixa um comando já concluído ficar preso esperando um refresh
+        # impossível depois que o usuário desligou a conexão.
+        self._complete_status_refresh_waiters()
+        self.async_set_update_error(
+            PanelConnectionError("Comunicação com a central está desativada")
+        )
 
     def resume_polling(self) -> None:
-        """Restaura o intervalo de consulta configurado, depois de pause_polling().
+        """Inicia/retoma o scheduler usando o intervalo configurado.
 
-        Não dispara uma consulta sozinho — quem chama continua responsável
-        por pedir um ciclo nova (``await coordinator.async_request_refresh()``),
-        exatamente como já era feito ao religar o switch.
+        Usa ``entry.async_create_background_task()``, e não
+        ``hass.async_create_task()`` (usado na versão anterior deste
+        scheduler) — bug real, relatado pelo usuário e confirmado
+        diretamente no código-fonte do Home Assistant instalado
+        (``homeassistant/core.py``): ``hass.async_create_task()``
+        registra a task em ``hass._tasks``, um conjunto que
+        ``hass.async_block_till_done()`` espera terminar. Como
+        ``_polling_loop()`` roda indefinidamente enquanto a conexão
+        estiver ligada, qualquer chamada a ``async_block_till_done()``
+        durante ou logo após a inicialização do Home Assistant ficava
+        esperando uma task que nunca termina sozinha — causando a
+        inicialização exageradamente lenta relatada. O próprio
+        docstring do HA já orienta nesse sentido: "If you are using
+        this in your integration, use the create task methods on the
+        config entry instead." ``entry.async_create_background_task()``
+        usa ``hass._background_tasks`` em vez de ``hass._tasks``
+        internamente — explicitamente documentado como "Will not block
+        startup" e "Calls to async_block_till_done will not wait for
+        completion" — além de já cancelar a task automaticamente no
+        unload da config entry, complementar (não substitui) o
+        ``async_stop_polling()`` explícito chamado em
+        ``entry.async_on_unload()``.
         """
-        self.update_interval = self._configured_polling_interval
+        self._polling_enabled = True
+        if self._polling_task is None or self._polling_task.done():
+            self._polling_task = self.entry.async_create_background_task(
+                self.hass,
+                self._polling_loop(),
+                name=f"intelbras_alarm_status_poll_{self.entry.entry_id}",
+            )
+        self._polling_wakeup.set()
+
+    async def async_stop_polling(self) -> None:
+        """Encerra definitivamente o scheduler durante unload/reload."""
+        self._polling_enabled = False
+        self._polling_wakeup.set()
+        self._complete_status_refresh_waiters()
+        task = self._polling_task
+        self._polling_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    async def async_request_status_refresh(self) -> None:
+        """Pede um STATUS pelo scheduler e aguarda esse próximo ciclo.
+
+        Usado depois de PGM/arm/disarm/bypass e ao religar a conexão.
+        O pedido acorda o scheduler, mas NUNCA fura o intervalo configurado.
+        Pedidos concorrentes são coalescidos no mesmo próximo STATUS.
+        """
+        if not self.client.enabled:
+            return
+        if not self._polling_enabled:
+            self.resume_polling()
+
+        waiter: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._status_refresh_waiters.add(waiter)
+        self._polling_wakeup.set()
+        try:
+            await waiter
+        finally:
+            self._status_refresh_waiters.discard(waiter)
 
     @property
     def max_zones(self) -> int:
@@ -360,6 +599,33 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
         return atual >= minimo
 
     @property
+    def _legacy_eeprom_password(self) -> str | None:
+        """Senha opcional de leitura de mensagens (0xE7 + identificação),
+        ver ``protocol_legacy_eeprom.py`` e ``supports_legacy_eeprom``
+        abaixo. Em branco por padrão — só habilita a funcionalidade se o
+        usuário preencher explicitamente na configuração.
+
+        BUG REAL corrigido (relatado pelo usuário): antes, este valor era
+        lido de ``entry.data`` **uma única vez**, em ``__init__``, e
+        guardado num atributo simples — se o usuário removesse a senha
+        pela reconfiguração da integração, a consulta de tensão
+        periódica continuava rodando (comportamento incorreto: a senha
+        removida deveria desativar esse serviço). Não consegui isolar
+        com certeza total o mecanismo exato do recarregamento que
+        deixava uma instância antiga do coordinator viva — a sequência
+        de unload/reload do próprio Home Assistant, conferida direto no
+        código-fonte, parece correta — mas ``entry`` é o mesmo objeto
+        mutado no lugar por ``async_update_entry()`` (confirmado também
+        direto no código-fonte do HA) independentemente de qual
+        instância do coordinator o mantém referenciado. Lendo direto de
+        ``self.entry.data`` a cada consulta, em vez de confiar num valor
+        travado no momento da criação, fecha essa lacuna por completo,
+        não importa a causa exata por trás da instância antiga
+        persistir.
+        """
+        return self.entry.data.get(CONF_LEGACY_EEPROM_PASSWORD) or None
+
+    @property
     def supports_legacy_eeprom(self) -> bool:
         """Se esta central pode ler nomes de zona/usuário e eventos pelo
         protocolo legado (comando ``0xE7`` + identificação por senha de
@@ -403,13 +669,29 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
         confirmado funcionando mesmo em modelos que usam ``0x5C`` para
         nomes/eventos — testado pelo usuário numa AMT 4010 SMART
         (firmware 5.2, onde ``supports_extended_eeprom`` já é ``True``,
-        e portanto ``supports_legacy_eeprom`` seria ``False``). A única
-        condição real é ter a senha de 6 dígitos configurada **e** a
-        família ter um offset confirmado (``const.VOLTAGE_OFFSETS`` —
-        hoje só família 2018 e 4010; não se aplica à ANM 24 Net nem à
-        AMT 8000, que usam protocolos totalmente diferentes).
+        e portanto ``supports_legacy_eeprom`` seria ``False``).
+
+        Três condições: (1) senha de 6 dígitos configurada, (2) família
+        com offset confirmado (``const.VOLTAGE_OFFSETS`` — hoje só
+        família 2018 e 4010; não se aplica à ANM 24 Net nem à AMT 8000,
+        que usam protocolos totalmente diferentes), e (3) a opção
+        ``CONF_VOLTAGE_READING_ENABLED`` (bug real corrigido, pedido do
+        usuário: em modelos/firmwares antigos, a mesma senha acima é
+        obrigatória só para nomes de zona/eventos —
+        ``supports_legacy_eeprom`` — então antes desta opção existir,
+        esses usuários não tinham como desligar só a consulta de tensão
+        sem perder a outra funcionalidade também. Lida ao vivo de
+        ``entry.data`` a cada consulta, mesmo padrão/motivo de
+        ``_legacy_eeprom_password`` acima — sem cache travado na
+        criação. Padrão ``True`` deliberado: preserva o comportamento
+        de quem já tinha a senha preenchida antes desta opção existir,
+        sem exigir nenhuma ação para manter a tensão funcionando).
         """
-        return self._legacy_eeprom_password is not None and self.family in VOLTAGE_OFFSETS
+        return (
+            self._legacy_eeprom_password is not None
+            and self.family in VOLTAGE_OFFSETS
+            and self.entry.data.get(CONF_VOLTAGE_READING_ENABLED, True)
+        )
 
     def zone_enabled_by_default(self, zone: int) -> bool:
         """Se a zona deve nascer habilitada no registro de entidades.
@@ -516,6 +798,38 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
             return self._password
         return self._partition_passwords.get(partition) or self._password
 
+    def _resposta_bruta_mudou(
+        self, content: bytes, *, normalizar: Callable[[bytes], bytes] | None = None
+    ) -> bool:
+        """Filtro na resposta BRUTA (bytes), antes de interpretar —
+        pedido explícito do usuário, complementar ao filtro que já
+        existe em ``always_update=False`` (que compara o resultado JÁ
+        interpretado, ``PanelStatus``). Aqui a comparação acontece um
+        passo antes: evita até o trabalho de interpretar a resposta
+        quando os bytes já indicam que não há nada de novo.
+
+        ``normalizar``, se dado, é aplicado nos dois lados (bytes novos
+        e bytes em cache) antes de comparar — único uso disto hoje é a
+        AMT 8000, cuja resposta inclui segundo (as demais famílias só
+        têm minuto): sem normalizar, o byte do segundo faria a resposta
+        parecer sempre diferente, mesmo sem nenhuma mudança real,
+        reintroduzindo no nível de bytes o mesmo problema já corrigido
+        no nível de campos interpretados (ver
+        ``protocol_amt8000.normalizar_status_para_comparacao``).
+
+        Sempre atualiza o cache para os bytes recebidos AGORA (nunca os
+        normalizados) — o cache reflete sempre a última resposta válida
+        de verdade, não uma versão "editada"; a normalização é só uma
+        lente aplicada na hora de comparar, nunca no que fica guardado.
+        """
+        anterior = self._last_raw_status_content
+        self._last_raw_status_content = content
+        if anterior is None:
+            return True  # nunca teve nada em cache ainda — primeira leitura
+        if normalizar is not None:
+            return normalizar(content) != normalizar(anterior)
+        return content != anterior
+
     async def _async_update_data(self) -> PanelStatus:
         if not self.client.enabled:
             # Switch "Conexão com a central" desligado deliberadamente pelo
@@ -546,8 +860,14 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
             return await self._async_update_data_amt8000()
 
         try:
+            t_inicio_status = time.monotonic()
             response = await self.client.send_command(
-                _build_status_frame(self._password, self.family, self.model_key), context="consulta de status"
+                _build_status_frame(self._password, self.family, self.model_key),
+                context="consulta de status",
+                on_sent=self._mark_status_sent,
+            )
+            _LOGGER.debug(
+                "Consulta de status: respondida em %.3fs", time.monotonic() - t_inicio_status
             )
             if not response.valid_checksum:
                 raise UpdateFailed("Checksum inválido na resposta de status")
@@ -589,9 +909,19 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
                         f"{response.content.hex(' ').upper()}"
                     )
 
-            status = parse_status(response.content, self.family)
-            if self.model_key == MODEL_2018_SMART:
-                self.esmart_extra = parse_status_2018_esmart_extra(response.content)
+            # Filtro na resposta BRUTA, antes de interpretar — pedido
+            # explícito do usuário, complementar ao always_update=False
+            # (que já filtra o resultado interpretado). Sempre chama
+            # _resposta_bruta_mudou() mesmo quando já sabemos que vamos
+            # reinterpretar de qualquer forma — ela também atualiza o
+            # cache como efeito colateral, então precisa rodar sempre.
+            resposta_mudou = self._resposta_bruta_mudou(response.content)
+            if not resposta_mudou and self.data is not None:
+                status = self.data
+            else:
+                status = parse_status(response.content, self.family)
+                if self.model_key == MODEL_2018_SMART:
+                    self.esmart_extra = parse_status_2018_esmart_extra(response.content)
         except (PanelConnectionError, UpdateFailed, IndexError, ValueError) as err:
             self._handle_poll_failure(err)
             # _handle_poll_failure() levanta UpdateFailed se a falha não for
@@ -632,9 +962,10 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
         # Só produz saída com o logger desta integração em nível DEBUG
         # (ver README, seção "Diagnóstico").
         _LOGGER.debug(
-            "status recebido: conteúdo=%s | activated(central)=%s partitions_armed=%s "
+            "status recebido: conteúdo=%s | %sactivated(central)=%s partitions_armed=%s "
             "zone_triggered=%s siren_on=%s problem=%s",
             response.content.hex(" ").upper(),
+            "(bruto inalterado, reaproveitado sem reinterpretar) " if not resposta_mudou else "",
             status.activated,
             status.partitions_armed,
             status.zone_triggered,
@@ -730,7 +1061,9 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
         """
         try:
             response = await self.client.send_command(
-                amt8000.cmd_status(), context="consulta de status (AMT 8000)"
+                amt8000.cmd_status(),
+                context="consulta de status (AMT 8000)",
+                on_sent=self._mark_status_sent,
             )
             if not response.valid_checksum:
                 raise UpdateFailed("Checksum inválido na resposta de status (AMT 8000)")
@@ -756,7 +1089,20 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
                     f"{response.content.hex(' ').upper()}"
                 )
 
-            status = amt8000.parse_status(response.content)
+            # Filtro na resposta BRUTA, antes de interpretar — mesmo
+            # mecanismo do caminho 2018/4010 (ver _async_update_data),
+            # mas com normalização: essa família reporta segundo (as
+            # demais só têm minuto), então comparar bytes crus sem
+            # normalizar faria a resposta parecer sempre diferente a
+            # cada segundo, mesmo sem nenhuma mudança real — ver
+            # protocol_amt8000.normalizar_status_para_comparacao().
+            resposta_mudou = self._resposta_bruta_mudou(
+                response.content, normalizar=amt8000.normalizar_status_para_comparacao
+            )
+            if not resposta_mudou and self.data is not None:
+                status = self.data
+            else:
+                status = amt8000.parse_status(response.content)
         except (*_ANY_PANEL_CONNECTION_ERROR, UpdateFailed, IndexError, ValueError) as err:
             self._handle_poll_failure(err)
             if self.data is not None:
@@ -778,9 +1124,10 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
         self._last_poll_success_monotonic = time.monotonic()
 
         _LOGGER.debug(
-            "AMT 8000 status recebido: conteúdo=%s | activated=%s partitions_armed=%s "
+            "AMT 8000 status recebido: conteúdo=%s | %sactivated=%s partitions_armed=%s "
             "zone_triggered=%s siren_on=%s problem=%s",
             response.content.hex(" ").upper(),
+            "(bruto inalterado, reaproveitado sem reinterpretar) " if not resposta_mudou else "",
             status.activated,
             status.partitions_armed,
             status.zone_triggered,
@@ -883,7 +1230,7 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
             await self._send_and_check_amt8000(frame, label)
             key = partition or "CENTRAL"
             self.armed_home_mode[key] = stay
-            await self.async_request_refresh()
+            await self.async_request_status_refresh()
             return
         code = None if partition is None else _partition_code(partition)
         frame = cmd_arm(password or self._password, code, stay=stay)
@@ -891,7 +1238,7 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
         await self._send_and_check(frame, label)
         key = partition or "CENTRAL"
         self.armed_home_mode[key] = stay
-        await self.async_request_refresh()
+        await self.async_request_status_refresh()
 
     async def async_disarm(self, partition: str | None, password: str | None = None) -> None:
         if self.family == FAMILY_ANM24_G2:
@@ -907,7 +1254,7 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
             await self._send_and_check_amt8000(frame, label)
             key = partition or "CENTRAL"
             self.armed_home_mode[key] = False
-            await self.async_request_refresh()
+            await self.async_request_status_refresh()
             return
         code = None if partition is None else _partition_code(partition)
         frame = cmd_disarm(password or self._password, code)
@@ -915,7 +1262,7 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
         await self._send_and_check(frame, label)
         key = partition or "CENTRAL"
         self.armed_home_mode[key] = False
-        await self.async_request_refresh()
+        await self.async_request_status_refresh()
 
     async def async_set_pgm(self, address: int, turn_on: bool, pgm: int | None = None) -> None:
         if self.family == FAMILY_8000:
@@ -924,13 +1271,13 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
             frame = amt8000.cmd_pgm(pgm, turn_on)
             label = f"{'Ligar' if turn_on else 'Desligar'} PGM {pgm}"
             await self._send_and_check_amt8000(frame, label)
-            await self.async_request_refresh()
+            await self.async_request_status_refresh()
             return
         frame = cmd_pgm(self._password, address, turn_on)
         pgm_label = f"PGM {pgm}" if pgm is not None else f"PGM (endereço 0x{address:02X})"
         label = f"{'Ligar' if turn_on else 'Desligar'} {pgm_label}"
         await self._send_and_check(frame, label)
-        await self.async_request_refresh()
+        await self.async_request_status_refresh()
 
     async def async_set_siren(self, turn_on: bool) -> None:
         if self.family == FAMILY_8000:
@@ -946,7 +1293,7 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
         frame = cmd_siren(self._password, turn_on)
         label = "Ligar sirene" if turn_on else "Desligar sirene"
         await self._send_and_check(frame, label)
-        await self.async_request_refresh()
+        await self.async_request_status_refresh()
 
     def _recusar_v1_na_anm24(self, operacao: str) -> None:
         """Barra operacoes que so existem no enquadramento V1 nesta central.
@@ -1001,7 +1348,7 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
             for zone in sorted(zones_to_bypass):
                 frame = amt8000.cmd_bypass(zone, True)
                 await self._send_and_check_amt8000(frame, f"Anular zona {zone}")
-            await self.async_request_refresh()
+            await self.async_request_status_refresh()
             return
 
         target = set(zones_to_bypass)
@@ -1017,7 +1364,7 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
         zones_fmt = ", ".join(str(z) for z in sorted(zones_to_bypass))
         label = f"Anular zona(s) {zones_fmt}"
         await self._send_and_check(frame, label)
-        await self.async_request_refresh()
+        await self.async_request_status_refresh()
         _LOGGER.debug(
             "async_bypass_zones: após refresh, anuladas_agora=%s",
             {z for z, b in self.data.zones_bypassed.items() if b} if self.data else "sem status",
@@ -1066,7 +1413,7 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
             return
         frame = cmd_bypass(self._password, {})
         await self._send_and_check(frame, "Remover todas as anulações de zona")
-        await self.async_request_refresh()
+        await self.async_request_status_refresh()
 
     async def async_unbypass_zones(self, zones: set[int]) -> None:
         """Reativa uma ou mais zonas, preservando as demais anulações existentes.
@@ -1086,7 +1433,7 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
             for zone in sorted(zones):
                 frame = amt8000.cmd_bypass(zone, False)
                 await self._send_and_check_amt8000(frame, f"Reativar zona {zone}")
-            await self.async_request_refresh()
+            await self.async_request_status_refresh()
             return
 
         current: set[int] = set()
@@ -1101,7 +1448,7 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
         frame = cmd_bypass(self._password, {z: True for z in current})
         zones_fmt = ", ".join(str(z) for z in sorted(zones))
         await self._send_and_check(frame, f"Reativar zona(s) {zones_fmt}")
-        await self.async_request_refresh()
+        await self.async_request_status_refresh()
         _LOGGER.debug(
             "async_unbypass_zones: após refresh, anuladas_agora=%s",
             {z for z, b in self.data.zones_bypassed.items() if b} if self.data else "sem status",
@@ -1200,6 +1547,22 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
         return result
 
     async def _send_and_check(self, frame: bytes, action_label: str | None = None) -> None:
+        """Envia um comando de usuário com prioridade sobre o scheduler de
+        status (pedido explícito do usuário — ver ``self._pode_iniciar_status``
+        no ``__init__``): impede que o scheduler *inicie* uma nova consulta
+        de status enquanto este comando estiver em andamento. Não interrompe
+        uma consulta que já esteja em voo no momento em que o comando chega
+        — essa parte já é garantida pelo próprio lock da conexão, sem
+        precisar de nada especial aqui.
+        """
+        self._pode_iniciar_status.clear()
+        try:
+            await self._send_and_check_impl(frame, action_label)
+        finally:
+            self._pode_iniciar_status.set()
+            self._polling_wakeup.set()
+
+    async def _send_and_check_impl(self, frame: bytes, action_label: str | None = None) -> None:
         # Grava a ação sendo enviada ANTES da resposta chegar, e notifica
         # os listeners imediatamente (async_update_listeners, sem esperar
         # um novo ciclo de polling) — assim o sensor "Último comando" fica
@@ -1294,6 +1657,20 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
         self.async_update_listeners()
 
     async def _send_and_check_amt8000(self, frame: bytes, action_label: str | None = None) -> None:
+        """Envia um comando de usuário (AMT 8000) com prioridade sobre o
+        scheduler de status — mesmo mecanismo/motivo de ``_send_and_check``
+        para as demais famílias, ver docstring lá.
+        """
+        self._pode_iniciar_status.clear()
+        try:
+            await self._send_and_check_amt8000_impl(frame, action_label)
+        finally:
+            self._pode_iniciar_status.set()
+            self._polling_wakeup.set()
+
+    async def _send_and_check_amt8000_impl(
+        self, frame: bytes, action_label: str | None = None
+    ) -> None:
         """Equivalente a ``_send_and_check`` para a AMT 8000.
 
         ⚠️ IMPORTANTE (limitação conhecida, ver README_DETALHADO.md): ao
@@ -1355,54 +1732,138 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
     # comando, `0xE7` incluso (`protocol.parse_frame()` não assume nenhum
     # comando específico).
     # ------------------------------------------------------------------
+    async def _async_close_legacy_eeprom_connection(self, context: str) -> None:
+        """Encerra a conexão TCP após qualquer sessão autenticada ``0xE7``
+        (leitura de EEPROM legada ou consulta de tensão), sucesso ou falha.
+
+        BUG REAL corrigido (diagnóstico do próprio usuário, com log
+        batendo exatamente): sem isso, bytes residuais podiam ficar no
+        stream TCP após uma sessão ``0xE7`` (ex.: resposta de logout
+        implícito da central, ou qualquer sobra do protocolo com sessão),
+        dessincronizando o leitor genérico da PRÓXIMA consulta de status
+        — que interpretava o primeiro byte residual como "Nº Bytes" e
+        ficava esperando um total que nunca fecha. Log observado:
+        "recebidos 60/73" — batia exatamente com 3 bytes residuais + o
+        frame de status real de 57 bytes, confirmando dessincronização de
+        enquadramento, não timeout insuficiente (por isso não adianta só
+        aumentar o timeout — a causa é outra).
+
+        Fecha incondicionalmente, mesmo em sucesso: qualquer saída de uma
+        sessão ``0xE7`` (autenticação negada, checksum inválido, erro de
+        protocolo, ou sucesso completo) força o próximo comando (status,
+        PGM, etc.) a começar num stream TCP nunca usado, sem chance de
+        arrastar sobra nenhuma. O custo é reconectar a cada leitura —
+        aceitável: tensão roda só a cada 5 minutos, e a leitura legada de
+        nomes/eventos é esporádica (configuração inicial ou pedido
+        manual).
+
+        Deve ser chamado ainda dentro de ``client.transaction()`` — usa
+        ``disconnect_in_transaction()``, não ``disconnect()``, para não
+        tentar readquirir o lock e causar deadlock.
+        """
+        if not self.client.connected:
+            return
+        try:
+            await self.client.disconnect_in_transaction()
+            _LOGGER.debug(
+                "Sessão 0xE7: conexão TCP encerrada após %s (evita "
+                "dessincronizar a próxima consulta de status)",
+                context,
+            )
+        except (OSError, asyncio.TimeoutError) as err:
+            # _close_locked() já protege wait_closed() com timeout; isto é
+            # apenas uma salvaguarda para não mascarar o resultado principal
+            # (o próximo comando reconecta do zero de qualquer forma).
+            _LOGGER.warning(
+                "Sessão 0xE7: falha ao encerrar TCP após %s (%s)", context, err
+            )
+
     async def _async_legacy_eeprom_session(self, paginas_info: list[tuple[int, int]]) -> bytes:
         """Autentica com a senha de leitura e lê todas as páginas pedidas
         em sequência, na conexão persistente já existente.
 
         ``paginas_info`` é uma lista de (endereço, tamanho) — ver
         ``protocol_legacy_eeprom.paginas()``.
+
+        Toda a sessão (autenticação + todas as páginas) roda dentro de
+        uma única transação atômica (ver
+        ``panel_client.PanelClient.transaction()``) — mesma correção
+        aplicada em ``async_refresh_voltage()``, pelo mesmo motivo: sem
+        isso, o polling rápido de status podia se intercalar no meio da
+        troca autenticada. Aqui o impacto é mais raro na prática (só
+        roda na configuração inicial ou por pedido manual — botão de
+        sincronizar, ou serviço ``read_events`` —, nunca continuamente a
+        cada poucos segundos como a tensão), mas o risco de intercalar
+        no meio de uma sessão `0xE7` é o mesmo.
         """
-        frame_auth = legacy_eeprom.montar_comando_autenticar(self._legacy_eeprom_password)
+        t_inicio = time.monotonic()
         try:
-            resposta_auth = await self.client.send_command(
-                frame_auth, context="identificação (senha de leitura de mensagens)"
-            )
+            async with self.client.transaction():
+                try:
+                    # O fechamento da conexão (finally abaixo) deve cobrir a
+                    # sessão 0xE7 INTEIRA, inclusive autenticação negada, erro
+                    # de protocolo e qualquer exceção durante as leituras —
+                    # ver `_async_close_legacy_eeprom_connection` para o motivo.
+                    frame_auth = legacy_eeprom.montar_comando_autenticar(
+                        self._legacy_eeprom_password
+                    )
+                    resposta_auth = await self.client.send_command_in_transaction(
+                        frame_auth, context="identificação (senha de leitura de mensagens)"
+                    )
+                    _LOGGER.debug(
+                        "Sessão legada 0xE7: autenticação respondida em %.3fs",
+                        time.monotonic() - t_inicio,
+                    )
+                    if not legacy_eeprom.autenticacao_bem_sucedida(resposta_auth.content):
+                        raise HomeAssistantError(
+                            "Falha na identificação com a senha de leitura de mensagens "
+                            "configurada — confira se está correta (6 dígitos, "
+                            "\"Senha Acesso Remoto\" no app AMT Mobile)"
+                        )
+                    await asyncio.sleep(legacy_eeprom.DELAY_ENTRE_REQUISICOES)
+
+                    dados = bytearray()
+                    for endereco, tamanho in paginas_info:
+                        frame = legacy_eeprom.montar_comando_leitura(endereco, tamanho)
+                        t_pagina = time.monotonic()
+                        resposta = await self.client.send_command_in_transaction(
+                            frame, context=f"leitura legada de EEPROM 0x{endereco:04X}"
+                        )
+                        _LOGGER.debug(
+                            "Sessão legada 0xE7: página 0x%04X respondida em %.3fs "
+                            "(%.3fs desde o início da sessão)",
+                            endereco,
+                            time.monotonic() - t_pagina,
+                            time.monotonic() - t_inicio,
+                        )
+                        if not resposta.valid_checksum:
+                            raise UpdateFailed(
+                                f"Checksum inválido lendo EEPROM legada no endereço 0x{endereco:04X}"
+                            )
+                        # content = [2 bytes de cabeçalho, sempre presentes nesse
+                        # protocolo — confirmados em toda captura real analisada,
+                        # não dependem do endereço] + dados úteis. Ver
+                        # README_DETALHADO.md, seção "Protocolo legado".
+                        dados_uteis = legacy_eeprom.extrair_dados_leitura(resposta.content, tamanho)
+                        if dados_uteis is None:
+                            raise UpdateFailed(
+                                f"Resposta incompleta lendo EEPROM legada no endereço "
+                                f"0x{endereco:04X}: recebidos {len(resposta.content)} bytes de "
+                                f"conteúdo, esperados pelo menos {2 + tamanho}"
+                            )
+                        dados += dados_uteis
+                        await asyncio.sleep(legacy_eeprom.DELAY_ENTRE_REQUISICOES)
+                finally:
+                    await self._async_close_legacy_eeprom_connection(
+                        "sessão de leitura de EEPROM"
+                    )
         except PanelConnectionError as err:
             raise UpdateFailed(str(err)) from err
-        if not legacy_eeprom.autenticacao_bem_sucedida(resposta_auth.content):
-            raise HomeAssistantError(
-                "Falha na identificação com a senha de leitura de mensagens "
-                "configurada — confira se está correta (6 dígitos, "
-                "\"Senha Acesso Remoto\" no app AMT Mobile)"
-            )
-        await asyncio.sleep(legacy_eeprom.DELAY_ENTRE_REQUISICOES)
-
-        dados = bytearray()
-        for endereco, tamanho in paginas_info:
-            frame = legacy_eeprom.montar_comando_leitura(endereco, tamanho)
-            try:
-                resposta = await self.client.send_command(
-                    frame, context=f"leitura legada de EEPROM 0x{endereco:04X}"
-                )
-            except PanelConnectionError as err:
-                raise UpdateFailed(str(err)) from err
-            if not resposta.valid_checksum:
-                raise UpdateFailed(
-                    f"Checksum inválido lendo EEPROM legada no endereço 0x{endereco:04X}"
-                )
-            # content = [2 bytes de cabeçalho, sempre presentes nesse
-            # protocolo — confirmados em toda captura real analisada,
-            # não dependem do endereço] + dados úteis. Ver
-            # README_DETALHADO.md, seção "Protocolo legado".
-            dados_uteis = legacy_eeprom.extrair_dados_leitura(resposta.content, tamanho)
-            if dados_uteis is None:
-                raise UpdateFailed(
-                    f"Resposta incompleta lendo EEPROM legada no endereço "
-                    f"0x{endereco:04X}: recebidos {len(resposta.content)} bytes de "
-                    f"conteúdo, esperados pelo menos {2 + tamanho}"
-                )
-            dados += dados_uteis
-            await asyncio.sleep(legacy_eeprom.DELAY_ENTRE_REQUISICOES)
+        _LOGGER.debug(
+            "Sessão legada 0xE7: concluída em %.3fs (%d páginas)",
+            time.monotonic() - t_inicio,
+            len(paginas_info),
+        )
         return bytes(dados)
 
     async def async_refresh_voltage(self) -> None:
@@ -1445,31 +1906,68 @@ class IntelbrasAlarmCoordinator(DataUpdateCoordinator[PanelStatus]):
             # principal de status.
             return
         try:
-            frame_auth = legacy_eeprom.montar_comando_autenticar(self._legacy_eeprom_password)
-            resposta_auth = await self.client.send_command(
-                frame_auth, context="identificação (consulta de tensão)"
-            )
-            if not legacy_eeprom.autenticacao_bem_sucedida(resposta_auth.content):
-                _LOGGER.warning(
-                    "Consulta de tensão: falha na identificação com a senha de leitura "
-                    "configurada — tentando de novo em 5 minutos"
-                )
-                return
-            await asyncio.sleep(legacy_eeprom.DELAY_ENTRE_REQUISICOES)
+            # Transação atômica (ver panel_client.PanelClient.transaction())
+            # — bug real corrigido: autenticação + consulta antes rodavam
+            # como duas chamadas separadas de send_command(), cada uma
+            # soltando o lock — deixando uma janela real, durante o
+            # asyncio.sleep() entre elas, em que o polling rápido de
+            # status podia se intercalar NO MEIO da troca autenticada.
+            t_inicio = time.monotonic()
+            async with self.client.transaction():
+                try:
+                    frame_auth = legacy_eeprom.montar_comando_autenticar(
+                        self._legacy_eeprom_password
+                    )
+                    resposta_auth = await self.client.send_command_in_transaction(
+                        frame_auth, context="identificação (consulta de tensão)"
+                    )
+                    _LOGGER.debug(
+                        "Consulta de tensão: autenticação enviada e respondida em %.3fs",
+                        time.monotonic() - t_inicio,
+                    )
+                    if not legacy_eeprom.autenticacao_bem_sucedida(resposta_auth.content):
+                        _LOGGER.warning(
+                            "Consulta de tensão: falha na identificação com a senha de "
+                            "leitura configurada — tentando de novo em 5 minutos"
+                        )
+                        return
+                    await asyncio.sleep(legacy_eeprom.DELAY_ENTRE_REQUISICOES)
 
-            frame = legacy_eeprom.montar_comando_status_tensao()
-            resposta = await self.client.send_command(frame, context="consulta de tensão")
-            # Pausa de acomodação (heurística, não uma medição exata):
-            # timeouts reais na consulta de status normal foram
-            # observados sistematicamente coincidindo com múltiplos de 5
-            # minutos (ciclo da tensão) — indício de que a central
-            # precisa de um instante para "se recompor" depois dessa
-            # troca autenticada via 0xE7, antes de responder prontamente
-            # ao próximo 0x5A/0x5B do polling rápido. Aplicada aqui,
-            # cobrindo qualquer desfecho a partir deste ponto (sucesso
-            # ou falha de checksum/parse) — o exchange completo com a
-            # central já aconteceu de qualquer forma.
-            await asyncio.sleep(1.0)
+                    frame = legacy_eeprom.montar_comando_status_tensao()
+                    t_antes_consulta = time.monotonic()
+                    resposta = await self.client.send_command_in_transaction(
+                        frame, context="consulta de tensão"
+                    )
+                    _LOGGER.debug(
+                        "Consulta de tensão: comando de tensão enviado e respondido em %.3fs "
+                        "(%.3fs desde o início da transação)",
+                        time.monotonic() - t_antes_consulta,
+                        time.monotonic() - t_inicio,
+                    )
+                finally:
+                    # Fecha a conexão ainda dentro da transação (mesmo
+                    # motivo/mecanismo de `_async_legacy_eeprom_session` —
+                    # ver `_async_close_legacy_eeprom_connection`). Cobre
+                    # tanto o `return` de autenticação negada acima quanto
+                    # o caminho de sucesso.
+                    await self._async_close_legacy_eeprom_connection(
+                        "consulta de tensão"
+                    )
+                # Pausa de acomodação (heurística, não uma medição exata):
+                # intenção original deste sleep (desde a primeira versão que
+                # o introduziu), restaurada aqui após uma análise externa
+                # apontar corretamente que uma versão anterior desta mesma
+                # correção tinha deixado o sleep FORA do `async with` — nesse
+                # caso, o lock já estaria liberado antes da pausa, deixando o
+                # scheduler de status livre para abrir uma conexão nova e
+                # enviar um STATUS durante o próprio segundo que deveria ser
+                # de acomodação, sem proteger nada — só atrasando a
+                # atualização dos sensores de tensão em si, sem efeito real
+                # sobre a central. Aqui dentro do `async with`, de propósito:
+                # mantém o lock reservado durante a pausa inteira, dando à
+                # central um segundo sem nenhuma tentativa de nova conexão
+                # antes do próximo STATUS, mesmo com o TCP já fechado acima.
+                await asyncio.sleep(1.0)
             if not resposta.valid_checksum:
                 _LOGGER.warning("Consulta de tensão: checksum inválido na resposta")
                 return

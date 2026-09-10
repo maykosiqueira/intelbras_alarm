@@ -1201,6 +1201,75 @@ custom_components/intelbras_alarm/
 └── translations/          # pt-BR, pt, en
 ```
 
+### Scheduler próprio de polling de status (substitui `update_interval`)
+
+**Bug real corrigido**, achado com log em produção + análise cruzada de
+arquitetura: o `update_interval` do `DataUpdateCoordinator` não é
+preciso o suficiente para a cadência sub-segundo (0,25s) que esta
+integração precisa (capturar eventos de PIR, que só duram ~1000ms). O
+próprio código do `update_coordinator.py` do Home Assistant calcula o
+próximo horário como `int(loop.time()) + self._microsecond +
+update_interval` — o `int()` trunca a parte fracionária do relógio
+monotônico, e com intervalos sub-segundo isso frequentemente resulta
+num horário já no passado, fazendo `loop.call_at()` disparar quase
+imediatamente. Efeito observado (confirmado em log real e reproduzido
+numa simulação isolada): rajadas de 6-8 consultas em menos de 100ms,
+seguidas de uma pausa de várias centenas de ms, repetindo a cada
+segundo — não a cadência estável de 250ms pretendida.
+
+**Correção**: `update_interval=None` (o `DataUpdateCoordinator`
+continua sendo usado para armazenar/comparar `PanelStatus`,
+`always_update=False`, notificar entidades e disponibilidade — só o
+agendamento do polling muda) + `coordinator._polling_loop()`, um
+scheduler próprio baseado em `time.monotonic()`:
+
+- Marca o início de cada consulta no instante **exato** do envio
+  (`on_sent`, callback passado a `PanelClient.send_command()`,
+  disparado dentro do lock, logo antes de `writer.write()`) — não no
+  momento em que o ciclo é decidido, que pode ficar adiantado se algo
+  estiver segurando o lock nesse meio-tempo.
+- **Nunca recupera atraso**: se uma consulta demorar, a próxima só é
+  permitida a partir do intervalo configurado contado do início real
+  da anterior, nunca tentando "compensar" disparando várias em
+  sequência.
+- Fallback próprio para consultas que falham antes de conseguir
+  escrever no socket (quando `on_sent` nunca chega a disparar) —
+  evita um loop apertado nesse cenário específico de falha.
+- Pedidos de status extra após comandos (PGM, armar, desarmar, anular)
+  são coalescidos: múltiplos pedidos simultâneos compartilham a mesma
+  consulta seguinte, via `asyncio.Future` (`async_request_status_
+  refresh()`), em vez de gerar uma consulta para cada.
+
+#### Prioridade de comando sobre o scheduler de status
+
+Pedido explícito do usuário, complementar ao scheduler acima: um
+comando (PGM/armar/desarmar/etc.) precisa ter prioridade sobre a
+próxima consulta de status — não pode ficar preso atrás de várias
+consultas periódicas competindo pelo mesmo lock em ordem simples
+(FIFO), só atrás da que já estiver em voo no momento em que ele chega.
+
+Mecanismo: `coordinator._pode_iniciar_status` (`asyncio.Event`,
+começa "liberado"). `_send_and_check`/`_send_and_check_amt8000` — os
+dois únicos pontos que enviam comandos de usuário, cobrindo PGM,
+sirene, pânico, anulação de zona, armar e desarmar nas duas famílias
+de protocolo — limpam essa flag antes de enviar e a restauram no
+`finally`, envolvendo a lógica original (renomeada para `_impl`) sem
+alterá-la. O scheduler verifica a flag em dois pontos do
+`_polling_loop()`: antes de calcular o próximo horário permitido, e de
+novo depois de acordar de uma espera (caso um comando tenha começado
+durante ela) — nunca inicia uma consulta nova enquanto a flag estiver
+limpa. Não interrompe uma consulta já em andamento no momento em que o
+comando chega — isso já é garantido pelo `asyncio.Lock()` da conexão,
+sem precisar de nada especial; a flag só impede que o scheduler
+dispare *outra* antes do comando terminar.
+
+Validado com as funções reais, extraídas do arquivo publicado via AST,
+usando um `asyncio.Lock()` de verdade compartilhado entre uma consulta
+de status simulada e um comando simulado — confirmando a sequência
+completa esperada: `status em andamento → comando chega (impede novas
+consultas) → status em andamento termina normalmente → comando espera
+o lock, envia, conclui → status retoma`.
+
 ### Conexão TCP persistente
 `panel_client.PanelClient` abre a conexão uma única vez e a mantém aberta.
 Toda requisição é serializada por um `asyncio.Lock` (o protocolo é
@@ -1208,6 +1277,75 @@ estritamente requisição/resposta — a central nunca fala primeiro). Se a
 leitura ou escrita falhar (timeout, reset, etc.), o socket é fechado e a
 **próxima** requisição reabre a conexão automaticamente — nunca há
 desconexão proposital a cada ciclo de polling.
+
+#### Transações atômicas (`transaction()` / `send_command_in_transaction()`)
+
+**Bug real corrigido** (achado via análise cruzada de log em produção +
+revisão de arquitetura): `send_command()` sozinho adquire e libera o
+lock **a cada chamada individual** — adequado para comandos avulsos
+(status, arme/desarme, PGM), mas insuficiente para sequências como a
+do protocolo `0xE7` (autenticação seguida de um ou mais comandos, usada
+na consulta de tensão e na leitura legada de nomes/eventos), que
+precisam ser tratadas como uma única transação lógica. Sem essa
+garantia, o `asyncio.sleep()` entre a autenticação e o comando
+seguinte deixava uma janela real em que o polling rápido de status (a
+cada 0,25s) podia se intercalar **no meio** da troca autenticada —
+confirmado como a causa real de timeouts esporádicos na consulta de
+status, que apareciam sistematicamente no mesmo instante exato de cada
+ciclo de 5 minutos da consulta de tensão.
+
+`PanelClient.transaction()` devolve o próprio `asyncio.Lock` (já
+utilizável diretamente como `async with`), e
+`send_command_in_transaction()` é a mesma lógica de `send_command()`
+mas sem adquirir o lock sozinho — só deve ser chamada de dentro de um
+bloco `async with client.transaction():`. Uso:
+
+```python
+async with self.client.transaction():
+    r1 = await self.client.send_command_in_transaction(frame_auth, context="...")
+    await asyncio.sleep(DELAY)
+    r2 = await self.client.send_command_in_transaction(frame, context="...")
+```
+
+Usado em `coordinator.async_refresh_voltage()` e
+`coordinator._async_legacy_eeprom_session()` — os dois únicos pontos
+que usam o protocolo `0xE7` com autenticação de sessão.
+`send_command()` continua funcionando exatamente como antes para
+qualquer uso avulso (status, comandos do usuário, leituras via `0x5C`
+— que não têm conceito de sessão, cada comando já embute a própria
+senha).
+
+#### Duas camadas de filtro para evitar reescritas de estado desnecessárias
+
+A cada ciclo de polling (0,25s por padrão), a integração **sempre**
+pergunta o status pra central e **sempre** recebe/interpreta a
+resposta completa — não existe (nem faria sentido existir, dado que a
+central não avisa sozinha quando algo muda) nenhum jeito de "pular" a
+pergunta em si. O que existe são duas camadas, em sequência, que
+decidem se vale a pena **notificar o Home Assistant** depois que a
+resposta já chegou:
+
+1. **Filtro na resposta bruta** (`coordinator._resposta_bruta_mudou()`)
+   — compara os bytes crus da resposta atual contra os da última
+   resposta válida, ANTES de interpretar. Se forem idênticos,
+   reaproveita o `PanelStatus` já existente em vez de reprocessar do
+   zero — evita até o trabalho de interpretação, não só a notificação.
+2. **Filtro no resultado interpretado** (`always_update=False` no
+   `DataUpdateCoordinator`, ver seção "Melhoria" no CHANGELOG.md) —
+   compara o `PanelStatus` (novo ou reaproveitado da camada 1) contra
+   o anterior; só notifica as entidades se forem diferentes.
+
+⚠️ **Cuidado que se repete nas duas camadas**: a AMT 8000 é a única
+família cuja resposta inclui precisão de **segundo** (as demais só têm
+minuto). Sem tratamento especial, o byte/campo do segundo faria a
+resposta parecer sempre diferente, mesmo sem nenhuma mudança real —
+até 60 "mudanças" falsas por minuto. Resolvido nos dois níveis
+independentemente: `protocol_amt8000.normalizar_status_para_comparacao()`
+zera o byte do segundo (offset 70) antes da comparação bruta (camada
+1); `protocol_amt8000.parse_status()` trunca `panel_datetime_str` para
+precisão de minuto no texto final (camada 2). Nos dois casos, o
+segundo continua sendo lido/validado normalmente — só não entra na
+comparação.
 
 ### Dois timeouts diferentes, para dois problemas diferentes
 
@@ -1804,13 +1942,19 @@ com o polling normal.
   registrado; `async_refresh_voltage()` verifica sozinho
   `self.client.enabled` e sai em silêncio (sem log) quando desligado.
 - Timeouts esporádicos na consulta de status normal, coincidindo
-  sistematicamente com múltiplos de 5 minutos — a análise inicial
-  ("no pior caso, levemente atrasado") **subestimou o impacto real**;
-  a central aparentemente precisa de um instante para se recompor
-  depois da troca autenticada via `0xE7` antes de voltar a responder
-  prontamente ao polling rápido. Mitigado com uma pausa de acomodação
-  de 1 segundo logo após a consulta de tensão — heurística baseada na
-  correlação observada nos logs, não uma medição exata da causa raiz.
+  sistematicamente com o **mesmo instante exato** de cada ciclo de 5
+  minutos (não distribuídos aleatoriamente — confirmado com um segundo
+  log em produção). A mitigação inicial (pausa de acomodação de 1s
+  após a consulta de tensão) não resolveu — o problema não era a
+  central precisar "se recompor" **depois** da troca, era o polling
+  rápido de status conseguir se intercalar **durante** ela: cada
+  comando da sequência autenticada (`0xE7`) soltava o lock
+  individualmente, deixando uma janela real no `asyncio.sleep()` entre
+  a autenticação e o comando seguinte. Corrigido com um mecanismo de
+  transação atômica em `panel_client.py` (`transaction()` +
+  `send_command_in_transaction()`) — a sequência inteira agora mantém
+  o lock do início ao fim, sem intercalar. Ver seção própria mais
+  abaixo para o detalhe completo.
 
 **Ainda em aberto**: os endereços acima só foram confirmados numa
 central real (1016 NET); os três códigos de evento vistos numa leitura
